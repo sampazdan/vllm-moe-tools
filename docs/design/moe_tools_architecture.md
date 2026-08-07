@@ -9,10 +9,12 @@ together with weights immediately after `_compute_routing`, before EPLB maps
 logical IDs to physical replicas.
 
 `ExpertMapManager` and EPLB remain execution-placement mechanisms. Expert
-eligibility is deliberately separate: a per-layer boolean mask is applied to
-router logits before the existing router performs top-k. Weights stay loaded,
-checkpoint expert identity is unchanged, and fused expert execution is not
-modified.
+eligibility is deliberately separate: a stable per-layer boolean mask is bound
+on the router device before compilation and CUDA graph capture, then applied to
+selection scores before the existing top-k. Correction-bias routers retain a
+separate masked selection bias so disabled experts cannot re-enter after the
+score activation. Weights stay loaded, checkpoint expert identity is unchanged,
+and fused expert execution is not modified.
 
 `RoutedExpertsCapturer` binds callbacks to modular `BaseRouter` instances, or
 to monolithic kernels that explicitly implement routing replay. It writes
@@ -24,7 +26,9 @@ Qwen3 MoE constructs `FusedMoE` through the generic runner. Backend selection
 is made by the quant method: modular backends expose routing before expert
 execution, while monolithic FlashInfer/TRT-LLM-style implementations own
 routing internally. Therefore eligibility currently fails closed for
-monolithic paths. The exact Qwen3.6 FP8 choice on an RTX PRO 6000 depends on
+monolithic paths. Random simulation, zero-expert routing, hash routing, and
+custom routing also fail closed because they cannot guarantee
+pre-top-k exclusion. The exact Qwen3.6 FP8 choice on an RTX PRO 6000 depends on
 the installed CUDA/backend versions and runtime flags and must be recorded
 from startup logs on the target host; it cannot be established from source or
 validated on this CPU-only checkout.

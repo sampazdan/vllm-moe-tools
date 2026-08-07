@@ -1,0 +1,95 @@
+# syntax=docker/dockerfile:1.7
+
+# This tag is the CUDA/PyTorch base used for Stage 2 hardware acceptance.
+ARG TARGETPLATFORM=linux/amd64
+FROM --platform=${TARGETPLATFORM} runpod/pytorch:1.0.3-cu1300-torch290-ubuntu2404@sha256:393d78eef4ad2b5440f2545848a1257078494604e3c3df6b98b0631de4d5f7bb
+
+ARG VLLM_PRECOMPILED_WHEEL_COMMIT=b1e12d142d8c9533f857f8da13d8fc368e95a8cd
+ARG VLLM_PRECOMPILED_WHEEL_VARIANT=cu130
+ARG VLLM_IMAGE_VERSION=0.1.dev1+stage2
+ARG VLLM_SOURCE_REF=stage-2-worktree
+
+LABEL org.opencontainers.image.title="vLLM MoE tools RunPod development image" \
+      org.opencontainers.image.description="Stage 2 expert pruning and benchmark environment" \
+      org.opencontainers.image.revision="${VLLM_SOURCE_REF}"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    UV_HTTP_TIMEOUT=500 \
+    UV_LINK_MODE=copy \
+    UV_CACHE_DIR=/root/.cache/uv \
+    PATH=/opt/vllm-venv/bin:/root/.local/bin:${PATH} \
+    VIRTUAL_ENV=/opt/vllm-venv \
+    HF_HOME=/workspace/cache/huggingface \
+    HUGGINGFACE_HUB_CACHE=/workspace/cache/huggingface/hub \
+    VLLM_CACHE_ROOT=/workspace/cache/vllm \
+    TORCHINDUCTOR_CACHE_DIR=/workspace/cache/torchinductor \
+    TRITON_CACHE_DIR=/workspace/cache/triton \
+    RUNPOD_RESULTS_DIR=/workspace/results \
+    RUNPOD_VLLM_SOURCE_REF=${VLLM_SOURCE_REF} \
+    RUNPOD_VLLM_MODEL=Qwen/Qwen3.6-35B-A3B-FP8 \
+    RUNPOD_VLLM_HOST=0.0.0.0 \
+    RUNPOD_VLLM_PORT=8000 \
+    RUNPOD_VLLM_MAX_MODEL_LEN=4096 \
+    RUNPOD_VLLM_GPU_MEMORY_UTILIZATION=0.90 \
+    RUNPOD_VLLM_MAX_NUM_BATCHED_TOKENS=2048 \
+    RUNPOD_VLLM_MAX_NUM_SEQS=8 \
+    VLLM_USE_DEEP_GEMM=0
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        htop \
+        iproute2 \
+        jq \
+        less \
+        ninja-build \
+        numactl \
+        pciutils \
+        procps \
+        sysstat \
+        time \
+        tmux \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && uv venv --python 3.12 /opt/vllm-venv
+
+WORKDIR /opt/vllm-src
+COPY . .
+
+# Stage 2 changes are Python-only, so reuse the CUDA extensions built for the
+# branch's public main merge base. The version override makes this build work
+# without copying local Git metadata into the image.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    VLLM_USE_PRECOMPILED=1 \
+    VLLM_PRECOMPILED_WHEEL_COMMIT="${VLLM_PRECOMPILED_WHEEL_COMMIT}" \
+    VLLM_PRECOMPILED_WHEEL_VARIANT="${VLLM_PRECOMPILED_WHEEL_VARIANT}" \
+    VLLM_VERSION_OVERRIDE="${VLLM_IMAGE_VERSION}" \
+    uv pip install \
+        --python /opt/vllm-venv/bin/python \
+        --editable ".[bench]" \
+        --torch-backend=auto
+
+COPY docker/runpod/pre_start.sh /pre_start.sh
+COPY docker/runpod/profile.sh /etc/profile.d/vllm-runpod.sh
+COPY docker/runpod/runpod-serve.sh /usr/local/bin/runpod-serve
+COPY docker/runpod/runpod-bench.sh /usr/local/bin/runpod-bench
+COPY docker/runpod/make_moe_profile.py /usr/local/bin/make-moe-profile
+
+RUN chmod 0755 \
+        /pre_start.sh \
+        /usr/local/bin/runpod-serve \
+        /usr/local/bin/runpod-bench \
+        /usr/local/bin/make-moe-profile \
+    && chmod 0644 /etc/profile.d/vllm-runpod.sh \
+    && python -c "import torch, vllm; print(vllm.__version__, torch.__version__)"
+
+WORKDIR /workspace
+EXPOSE 8000
+
+# Intentionally inherit the RunPod base image's CMD ["/start.sh"]. It starts
+# SSH, the web terminal, and Jupyter, and invokes /pre_start.sh above.

@@ -127,6 +127,8 @@ def fused_topk(
 class FusedTopKRouter(BaseRouter):
     """Default router using standard fused top-k routing."""
 
+    supports_expert_eligibility = True
+
     def __init__(
         self,
         top_k: int,

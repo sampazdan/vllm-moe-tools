@@ -434,6 +434,14 @@ class Worker(WorkerBase):
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        expert_selection_profile = None
+        if profile_path := self.model_config.moe_expert_selection_profile:
+            from vllm.model_executor.layers.fused_moe.expert_selection import (
+                ExpertSelectionProfile,
+            )
+
+            expert_selection_profile = ExpertSelectionProfile.from_file(profile_path)
+
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),
@@ -442,14 +450,14 @@ class Worker(WorkerBase):
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
-        if profile_path := self.model_config.moe_expert_selection_profile:
+        if expert_selection_profile is not None:
             from vllm.model_executor.layers.fused_moe.expert_selection import (
-                ExpertSelectionProfile,
                 bind_expert_selection_profile,
             )
 
-            profile = ExpertSelectionProfile.from_file(profile_path)
-            bind_expert_selection_profile(self.model_runner.get_model(), profile)
+            bind_expert_selection_profile(
+                self.model_runner.get_model(), expert_selection_profile
+            )
 
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(

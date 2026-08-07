@@ -876,6 +876,10 @@ class EngineArgs:
             "--enable-return-routed-expert-weights",
             **model_kwargs["enable_return_routed_expert_weights"],
         )
+        model_group.add_argument(
+            "--moe-expert-selection-profile",
+            **model_kwargs["moe_expert_selection_profile"],
+        )
         model_group.add_argument("--max-logprobs", **model_kwargs["max_logprobs"])
         model_group.add_argument("--logprobs-mode", **model_kwargs["logprobs_mode"])
         model_group.add_argument("--use-fp64-gumbel", **model_kwargs["use_fp64_gumbel"])
