@@ -181,11 +181,21 @@ class BaseRouter(FusedMoERouter):
         self.top_k = top_k
         self.global_num_experts = global_num_experts
         self.capture_fn: Callable[[torch.Tensor], None] | None = None
+        self.capture_weights_fn: Callable[[torch.Tensor, torch.Tensor], None] | None = (
+            None
+        )
         self.expert_eligibility_mask: torch.Tensor | None = None
 
     def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
         """Set a capture callback for logical routed expert IDs."""
         self.capture_fn = capture_fn
+
+    def set_capture_weights_fn(
+        self,
+        capture_fn: Callable[[torch.Tensor, torch.Tensor], None] | None,
+    ) -> None:
+        """Set a capture callback for paired logical IDs and weights."""
+        self.capture_weights_fn = capture_fn
 
     def set_expert_eligibility_mask(self, mask: torch.Tensor | None) -> None:
         """Restrict routing to the experts selected by a boolean mask."""
@@ -313,6 +323,8 @@ class BaseRouter(FusedMoERouter):
         # Capture logical ids before EPLB mapping.
         if self.capture_fn is not None:
             self.capture_fn(topk_ids)
+        if self.capture_weights_fn is not None:
+            self.capture_weights_fn(topk_ids, topk_weights)
 
         # Step 3: Apply EPLB mapping
         topk_ids = self._apply_eplb_mapping(topk_ids)

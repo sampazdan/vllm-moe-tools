@@ -4,6 +4,7 @@ import types
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -42,6 +43,7 @@ def _capturer_with_buffer(
     num_experts_per_tok: int = 2,
     dp_rank: int = 0,
     tp_size: int = 1,
+    capture_weights: bool = False,
 ) -> RoutedExpertsCapturer:
     # Bypass __init__ so the test can use a CPU buffer and skip the
     # VllmConfig dependency. The CUDA device-tensor allocation in the
@@ -53,6 +55,16 @@ def _capturer_with_buffer(
         (max_tokens, num_layers, num_experts_per_tok),
         -1,
         dtype=torch.int32,
+    )
+    c.capture_weights = capture_weights
+    c.weight_device_buffer = (
+        torch.full(
+            (max_tokens, num_layers, num_experts_per_tok),
+            torch.nan,
+            dtype=torch.float32,
+        )
+        if capture_weights
+        else None
     )
     return c
 
@@ -128,6 +140,7 @@ def test_routed_experts_manager_uses_gemma4_top_k_experts():
     manager = RoutedExpertsManager(vllm_config, kv_cache_config)
 
     assert manager.routed_experts_by_slot.shape == (8, 3, 2)
+    assert manager.routed_expert_weights_by_slot is None
 
 
 def test_routed_experts_manager_uses_kimi_k3_experts_per_token():
@@ -154,6 +167,43 @@ def test_routed_experts_manager_uses_kimi_k3_experts_per_token():
     assert manager.routed_experts_by_slot.shape == (8, 3, 2)
 
 
+def test_routed_experts_manager_stores_paired_weights_by_slot():
+    hf_config = SimpleNamespace(
+        num_experts=8,
+        num_experts_per_token=2,
+        num_hidden_layers=3,
+    )
+    model_config = _make_model_config(hf_config)
+    model_config.enable_return_routed_expert_weights = True
+    vllm_config = SimpleNamespace(model_config=model_config)
+    kv_cache_spec = FullAttentionSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["layer"], kv_cache_spec)],
+    )
+    manager = RoutedExpertsManager(vllm_config, kv_cache_config)
+    ids = np.arange(12, dtype=np.int32).reshape(2, 3, 2)
+    weights = np.linspace(0.1, 0.9, 12, dtype=np.float32).reshape(2, 3, 2)
+
+    manager.store_batch(ids, np.array([1, 5]), weights)
+
+    assert manager.routed_expert_weights_by_slot is not None
+    np.testing.assert_array_equal(manager.routed_experts_by_slot[[1, 5]], ids)
+    np.testing.assert_array_equal(
+        manager.routed_expert_weights_by_slot[[1, 5]], weights
+    )
+    np.testing.assert_array_equal(manager.get([0], 2, token_start=1), ids[:1])
+    np.testing.assert_array_equal(
+        manager.get_weights([0], 2, token_start=1), weights[:1]
+    )
+
+
 def test_base_router_capture_pre_eplb_mapping():
     router = _make_router()
     captured = []
@@ -170,6 +220,27 @@ def test_base_router_capture_pre_eplb_mapping():
     assert topk_weights.shape == topk_ids.shape
     assert len(captured) == 1
     assert torch.equal(captured[0], torch.tensor([[1, 2], [3, 4]]))
+    assert torch.equal(topk_ids, torch.tensor([[11, 12], [13, 14]]))
+
+
+def test_base_router_captures_paired_weights_pre_eplb_mapping():
+    router = _make_router()
+    captured = []
+
+    def capture_fn(ids, weights):
+        captured.append((ids.clone(), weights.clone()))
+
+    router.set_capture_weights_fn(capture_fn)
+    topk_weights, topk_ids = router.select_experts(
+        hidden_states=torch.empty(1),
+        router_logits=torch.empty(1),
+    )
+
+    assert len(captured) == 1
+    captured_ids, captured_weights = captured[0]
+    assert torch.equal(captured_ids, torch.tensor([[1, 2], [3, 4]]))
+    assert torch.equal(captured_weights, torch.ones((2, 2)))
+    assert torch.equal(captured_weights, topk_weights)
     assert torch.equal(topk_ids, torch.tensor([[11, 12], [13, 14]]))
 
 
@@ -274,6 +345,35 @@ def test_public_binding_only_visits_target_model(monkeypatch):
     assert calls == [(7, topk_ids)]
 
 
+def test_public_binding_uses_paired_callback_when_weights_enabled(monkeypatch):
+    class DummyFusedMoE:
+        def __init__(self, layer_id):
+            self.layer_id = layer_id
+            self.router = _make_router()
+            self._quant_method = _make_modular_routed_experts().quant_method
+
+    module = DummyFusedMoE(layer_id=7)
+    import vllm.model_executor.layers.fused_moe.layer as fused_moe_layer
+
+    monkeypatch.setattr(fused_moe_layer, "MoERunner", DummyFusedMoE)
+    calls = []
+    capturer = types.SimpleNamespace(
+        capture_weights=True,
+        capture=lambda *args: calls.append(args),
+    )
+
+    bind_routed_experts_capturer(
+        types.SimpleNamespace(modules=lambda: [module]), capturer
+    )
+
+    assert module.router.capture_fn is None
+    assert module.router.capture_weights_fn is not None
+    topk_ids = torch.tensor([[5, 6]])
+    topk_weights = torch.tensor([[0.75, 0.25]])
+    module.router.capture_weights_fn(topk_ids, topk_weights)
+    assert calls == [(7, topk_ids, topk_weights)]
+
+
 def test_public_binding_rejects_monolithic_without_replay_support(monkeypatch):
     class DummyFusedMoE:
         def __init__(self):
@@ -322,6 +422,43 @@ def test_routed_experts_capturer_single_dp_no_metadata():
         capturer.capture(layer_id=0, topk_ids=topk)
     assert torch.equal(capturer.device_buffer[:3, 0, :], topk)
     assert capturer.device_buffer[3, 0, 0].item() == -1
+
+
+def test_routed_experts_capturer_preserves_id_weight_pairing():
+    capturer = _capturer_with_buffer(dp_rank=0, capture_weights=True)
+    topk_ids = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32)
+    topk_weights = torch.tensor(
+        [[0.6, 0.4], [0.75, 0.25], [0.9, 0.1]], dtype=torch.float16
+    )
+    ctx = SimpleNamespace(dp_metadata=None)
+
+    with patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx):
+        capturer.capture(
+            layer_id=0,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+
+    assert torch.equal(capturer.device_buffer[:3, 0, :], topk_ids)
+    assert capturer.weight_device_buffer is not None
+    torch.testing.assert_close(
+        capturer.weight_device_buffer[:3, 0, :],
+        topk_weights.float(),
+    )
+
+
+def test_routed_experts_capturer_requires_weights_when_enabled():
+    capturer = _capturer_with_buffer(dp_rank=0, capture_weights=True)
+    ctx = SimpleNamespace(dp_metadata=None)
+
+    with (
+        patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx),
+        pytest.raises(ValueError, match="enabled but not provided"),
+    ):
+        capturer.capture(
+            layer_id=0,
+            topk_ids=torch.tensor([[1, 2]], dtype=torch.int32),
+        )
 
 
 def test_routed_experts_capturer_dp_naive_concatenated_all_ranks():
@@ -397,6 +534,9 @@ def test_mrv2_async_output_returns_existing_routed_experts_field():
     routed_experts = RoutedExpertsTensors(
         routing_data=torch.arange(6, dtype=torch.int32, device="cuda").reshape(3, 1, 2),
         slot_mapping=torch.tensor([11, 12, 13], device="cuda"),
+        routing_weights=torch.linspace(
+            0.1, 0.6, 6, dtype=torch.float32, device="cuda"
+        ).reshape(3, 1, 2),
     )
     num_sampled = torch.tensor([1], dtype=torch.int32, device="cuda")
     sampler_output = SamplerOutput(
@@ -418,6 +558,11 @@ def test_mrv2_async_output_returns_existing_routed_experts_field():
     assert output.routed_experts is not None
     assert output.routed_experts.routing_data[:, 0, 0].tolist() == [0, 2, 4]
     assert output.routed_experts.slot_mapping.tolist() == [11, 12, 13]
+    assert output.routed_experts.routing_weights is not None
+    np.testing.assert_allclose(
+        output.routed_experts.routing_weights[:, 0, 0],
+        np.array([0.1, 0.3, 0.5], dtype=np.float32),
+    )
 
 
 @pytest.mark.parametrize("rank", [0, 1])
@@ -453,6 +598,7 @@ def test_v2_model_runner_accepts_routed_experts(monkeypatch):
     config = SimpleNamespace(
         model_config=SimpleNamespace(
             enable_return_routed_experts=True,
+            enable_return_routed_expert_weights=True,
             use_mla=False,
             logits_processors=None,
             enable_prompt_embeds=False,

@@ -32,6 +32,7 @@ def server():
         "32",
         "--enforce-eager",
         "--enable-return-routed-experts",
+        "--enable-return-routed-expert-weights",
         "--hf-overrides",
         '{"sliding_window": null}',
     ]
@@ -68,10 +69,14 @@ async def test_generate_routed_experts(client):
     choice = data["choices"][0]
 
     assert choice["routed_experts"] is not None
+    assert choice["routed_expert_weights"] is not None
     assert choice["token_ids"] is not None
 
     # routed_experts is base64-encoded .npy bytes; decode to ndarray.
     routed_experts = np.load(io.BytesIO(base64.b64decode(choice["routed_experts"])))
+    routed_expert_weights = np.load(
+        io.BytesIO(base64.b64decode(choice["routed_expert_weights"]))
+    )
     assert routed_experts.ndim == 3
     num_tokens, num_layers, topk = routed_experts.shape
     assert num_tokens > 0
@@ -79,3 +84,7 @@ async def test_generate_routed_experts(client):
     assert topk == NUM_EXPERTS_PER_TOK
     assert (routed_experts >= 0).all()
     assert (routed_experts < NUM_LOCAL_EXPERTS).all()
+    assert routed_expert_weights.shape == routed_experts.shape
+    assert routed_expert_weights.dtype == np.float32
+    assert np.isfinite(routed_expert_weights).all()
+    assert (routed_expert_weights >= 0).all()

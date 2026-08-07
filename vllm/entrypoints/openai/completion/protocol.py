@@ -618,6 +618,8 @@ class CompletionResponseChoice(OpenAIBaseModel):
     # ``None`` if (a) the request was aborted before any forward pass,
     # or (b) ``enable_return_routed_experts`` is off server-side.
     routed_experts: str | None = None
+    # Weights paired elementwise with ``routed_experts``, encoded identically.
+    routed_expert_weights: str | None = None
 
 
 class CompletionResponse(OpenAIBaseModel):

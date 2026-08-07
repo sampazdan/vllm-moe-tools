@@ -291,6 +291,13 @@ class ServingTokens(GenerateBaseServing):
                 buf = io.BytesIO()
                 np.save(buf, output.routed_experts)
                 routed_experts_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            routed_expert_weights_b64 = None
+            if output.routed_expert_weights is not None:
+                buf = io.BytesIO()
+                np.save(buf, output.routed_expert_weights)
+                routed_expert_weights_b64 = base64.b64encode(buf.getvalue()).decode(
+                    "ascii"
+                )
 
             choice_data = GenerateResponseChoice(
                 index=output.index,
@@ -298,6 +305,7 @@ class ServingTokens(GenerateBaseServing):
                 finish_reason=output.finish_reason if output.finish_reason else "stop",
                 token_ids=as_list(output.token_ids),
                 routed_experts=routed_experts_b64,
+                routed_expert_weights=routed_expert_weights_b64,
             )
 
             choices.append(choice_data)
@@ -414,6 +422,13 @@ class ServingTokens(GenerateBaseServing):
                         routed_experts_b64 = base64.b64encode(buf.getvalue()).decode(
                             "ascii"
                         )
+                    routed_expert_weights_b64 = None
+                    if output.routed_expert_weights is not None:
+                        buf = io.BytesIO()
+                        np.save(buf, output.routed_expert_weights)
+                        routed_expert_weights_b64 = base64.b64encode(
+                            buf.getvalue()
+                        ).decode("ascii")
 
                     chunk = GenerateStreamResponse(
                         request_id=request_id,
@@ -424,6 +439,7 @@ class ServingTokens(GenerateBaseServing):
                                 finish_reason=finish_reason,
                                 token_ids=as_list(delta_token_ids),
                                 routed_experts=routed_experts_b64,
+                                routed_expert_weights=routed_expert_weights_b64,
                             )
                         ],
                     )
