@@ -66,6 +66,9 @@ def test_detach_zero_copy_routed_experts_without_logprobs():
         routed_experts=RoutedExpertsLists(
             routing_data=_make_readonly(np.arange(12, dtype=np.int32).reshape(2, 3, 2)),
             slot_mapping=_make_readonly(np.array([7, 8], dtype=np.int64)),
+            routing_weights=_make_readonly(
+                np.linspace(0.1, 0.9, 12, dtype=np.float32).reshape(2, 3, 2)
+            ),
         ),
     )
     original = output.routed_experts
@@ -78,7 +81,11 @@ def test_detach_zero_copy_routed_experts_without_logprobs():
     assert detached is not original
     assert detached.routing_data is not original.routing_data
     assert detached.slot_mapping is not original.slot_mapping
+    assert detached.routing_weights is not original.routing_weights
     assert detached.routing_data.flags.writeable
     assert detached.slot_mapping.flags.writeable
+    assert detached.routing_weights is not None
+    assert detached.routing_weights.flags.writeable
     np.testing.assert_array_equal(detached.routing_data, original.routing_data)
     np.testing.assert_array_equal(detached.slot_mapping, original.slot_mapping)
+    np.testing.assert_array_equal(detached.routing_weights, original.routing_weights)

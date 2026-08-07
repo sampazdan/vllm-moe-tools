@@ -28,6 +28,8 @@ class AiterSharedRoutedFusedMoERouter(BaseRouter):
     num_fused_shared_experts > 0.
     """
 
+    supports_expert_eligibility = True
+
     def __init__(
         self,
         top_k: int,

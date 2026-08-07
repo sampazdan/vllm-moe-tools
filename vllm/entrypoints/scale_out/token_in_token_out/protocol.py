@@ -200,6 +200,7 @@ class GenerateResponseChoice(BaseModel):
     # ``None`` if (a) the request was aborted before any forward pass,
     # or (b) ``enable_return_routed_experts`` is off server-side.
     routed_experts: str | None = None
+    routed_expert_weights: str | None = None
 
     @field_validator("token_ids")
     @classmethod
@@ -215,6 +216,7 @@ class GenerateResponseStreamChoice(BaseModel):
     finish_reason: str | None = None
     token_ids: list[int] | None = None
     routed_experts: str | None = None
+    routed_expert_weights: str | None = None
 
 
 class GenerateStreamResponse(BaseModel):

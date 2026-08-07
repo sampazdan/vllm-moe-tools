@@ -38,11 +38,9 @@ class RoutedExpertsCapturer:
     """Worker-side capturer for routed experts, lives on GPU.
 
     Layer-level hooks call :meth:`capture` from inside the forward pass
-    with the per-layer ``topk_ids`` tensor. The tensor is sliced to the
-    tokens owned by this DP rank and written into a preallocated device
-    buffer. At the end of the step, :class:`GPUModelRunner` reads the
-    device buffer, issues a D2H copy into a pinned CPU buffer, and hands
-    the result to the scheduler via :class:`RoutedExpertsLists`.
+    with the per-layer ``topk_ids`` tensor and, when enabled, its paired
+    ``topk_weights`` tensor. The tensors are sliced to the tokens owned by
+    this DP rank and written into preallocated device buffers.
 
     The device / pinned-CPU transit buffers use ``torch.int32`` (not a
     narrow ``uint8``/``uint16`` sized by ``num_experts``). This keeps the
@@ -53,6 +51,7 @@ class RoutedExpertsCapturer:
     (``RoutedExpertsManager.routed_experts_by_slot``) still uses the
     narrow dtype -- numpy fancy-index assignment in ``store_batch``
     narrows the data on the way in.
+    Optional weight buffers use ``torch.float32`` / ``numpy.float32``.
 
     Invariants:
         - One instance per worker; shape is fixed at init and covers the
@@ -91,12 +90,27 @@ class RoutedExpertsCapturer:
             dtype=torch.int32,
             device=current_platform.device_type,
         )
+        self.capture_weights = getattr(
+            vllm_config.model_config,
+            "enable_return_routed_expert_weights",
+            False,
+        )
+        self.weight_device_buffer = (
+            torch.zeros_like(self.device_buffer, dtype=torch.float32)
+            if self.capture_weights
+            else None
+        )
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         # KV cache group whose slot layout the routing data is keyed by.
         self.attn_gid = get_routed_experts_attn_gid(kv_cache_config)
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+    def capture(
+        self,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+    ) -> None:
         """Capture expert routing decisions for a specific layer.
 
         Under data parallelism, ``topk_ids`` may have three different batch
@@ -122,7 +136,18 @@ class RoutedExpertsCapturer:
         Args:
             layer_id: The layer index.
             topk_ids: Tensor of shape (batch_size, num_routed_experts).
+            topk_weights: Weights paired elementwise with ``topk_ids``.
         """
+
+        weight_device_buffer = getattr(self, "weight_device_buffer", None)
+        if weight_device_buffer is not None:
+            if topk_weights is None:
+                raise ValueError("Routed expert weights were enabled but not provided.")
+            if topk_weights.shape != topk_ids.shape:
+                raise ValueError(
+                    "Routed expert IDs and weights must have identical shapes, got "
+                    f"{topk_ids.shape} and {topk_weights.shape}."
+                )
 
         ctx = get_forward_context()
         if ctx.dp_metadata is None:  # single dp
@@ -169,6 +194,8 @@ class RoutedExpertsCapturer:
                 # downstream ``device_buffer[...] = topk_ids[...]``
                 # setitem narrows into int32 automatically.
                 topk_ids = get_tp_group().all_gather(topk_ids, dim=0)
+                if topk_weights is not None:
+                    topk_weights = get_tp_group().all_gather(topk_weights, dim=0)
                 start_loc = 0
                 end_loc = token_num_per_dp
             else:
@@ -193,6 +220,11 @@ class RoutedExpertsCapturer:
         self.device_buffer[:token_num_per_dp, layer_id, :] = topk_ids[
             start_loc:end_loc, :
         ]
+        if weight_device_buffer is not None:
+            assert topk_weights is not None
+            weight_device_buffer[:token_num_per_dp, layer_id, :] = topk_weights[
+                start_loc:end_loc, :
+            ]
 
     def get_device_buffer(self) -> torch.Tensor:
         """Return the underlying device buffer so the model runner can
@@ -200,6 +232,10 @@ class RoutedExpertsCapturer:
         clone or fully drain it before the next forward pass overwrites it.
         """
         return self.device_buffer
+
+    def get_weight_device_buffer(self) -> torch.Tensor | None:
+        """Return the optional routed-expert weight buffer."""
+        return self.weight_device_buffer
 
     def get_routed_experts(
         self, slot_mappings: torch.Tensor, num_tokens: int
@@ -218,6 +254,9 @@ class RoutedExpertsCapturer:
         return RoutedExpertsTensors(
             routing_data=self.device_buffer[:num_tokens].clone(),
             slot_mapping=slot_mappings[self.attn_gid, :num_tokens].clone(),
+            routing_weights=self.weight_device_buffer[:num_tokens].clone()
+            if self.weight_device_buffer is not None
+            else None,
         )
 
 
@@ -245,11 +284,24 @@ def bind_routed_experts_capturer(
         ) -> None:
             capturer.capture(layer_id, topk_ids)
 
+        def capture_weights_fn(
+            topk_ids: torch.Tensor,
+            topk_weights: torch.Tensor,
+            layer_id: int = layer_id,
+            capturer: RoutedExpertsCapturer = capturer,
+        ) -> None:
+            capturer.capture(layer_id, topk_ids, topk_weights)
+
         quant_method = module._quant_method
         moe_kernel = getattr(quant_method, "moe_kernel", None)
         impl = getattr(moe_kernel, "impl", None)
         fused_experts = getattr(impl, "fused_experts", None)
         if quant_method.is_monolithic:
+            if getattr(capturer, "capture_weights", False):
+                raise ValueError(
+                    "Routed expert weight capture is not supported with "
+                    f"monolithic MoE kernel {type(fused_experts).__name__}."
+                )
             if not (
                 isinstance(fused_experts, FusedMoEExpertsMonolithic)
                 and fused_experts.supports_routing_replay_capture()
@@ -261,7 +313,10 @@ def bind_routed_experts_capturer(
             fused_experts.set_capture_fn(capture_fn)
             num_bound += 1
         elif isinstance(module.router, BaseRouter):
-            module.router.set_capture_fn(capture_fn)
+            if getattr(capturer, "capture_weights", False):
+                module.router.set_capture_weights_fn(capture_weights_fn)
+            else:
+                module.router.set_capture_fn(capture_fn)
             num_bound += 1
         else:
             raise ValueError(
@@ -301,9 +356,10 @@ class RoutedExpertsManager:
          calls :meth:`get` with the request's block IDs to recover
          the full per-token routing.
 
-    Memory: ``routed_experts_by_slot`` is sized for the whole block
-    pool (``num_blocks * block_size`` slots). For large block pools
-    this can reach multiple GB; see the init log for the exact size.
+    Memory: the slot buffers cover the whole block pool
+    (``num_blocks * block_size`` slots). The optional float32 weight
+    buffer adds four bytes per captured expert; see the init logs for
+    exact sizes.
     """
 
     def __init__(
@@ -337,6 +393,15 @@ class RoutedExpertsManager:
             ),
             dtype=expert_id_dtype,
         )
+        self.routed_expert_weights_by_slot = (
+            np.zeros_like(self.routed_experts_by_slot, dtype=np.float32)
+            if getattr(
+                vllm_config.model_config,
+                "enable_return_routed_expert_weights",
+                False,
+            )
+            else None
+        )
         logger.info(
             "RoutedExpertsManager CPU buffer: %.2f GB "
             "(slots=%d, layers=%d, top_k=%d, dtype=%s)",
@@ -346,15 +411,38 @@ class RoutedExpertsManager:
             num_experts_per_tok,
             self.routed_experts_by_slot.dtype.name,
         )
+        if self.routed_expert_weights_by_slot is not None:
+            logger.info(
+                "RoutedExpertsManager weight CPU buffer: %.2f GB (dtype=float32)",
+                self.routed_expert_weights_by_slot.nbytes / 1e9,
+            )
 
-    def store_batch(self, data: np.ndarray, slot_mapping: np.ndarray) -> None:
+    def store_batch(
+        self,
+        data: np.ndarray,
+        slot_mapping: np.ndarray,
+        weights: np.ndarray | None = None,
+    ) -> None:
         """Persist one step's routed experts into the slot buffer.
 
         Equivalent to ``slot_buffer[slot_mapping] = data``; numpy fancy
         indexing handles repeated / out-of-order indices. Called once
         per scheduler step in ``update_from_output``.
         """
+        if self.routed_expert_weights_by_slot is not None:
+            if weights is None:
+                raise ValueError("Routed expert weights were enabled but not provided.")
+            if weights.shape != data.shape:
+                raise ValueError(
+                    "Routed expert IDs and weights must have identical shapes, got "
+                    f"{data.shape} and {weights.shape}."
+                )
+        elif weights is not None:
+            raise ValueError("Routed expert weights were provided but not enabled.")
         self.routed_experts_by_slot[slot_mapping] = data
+        if self.routed_expert_weights_by_slot is not None:
+            assert weights is not None
+            self.routed_expert_weights_by_slot[slot_mapping] = weights
 
     def get(
         self,
@@ -387,15 +475,32 @@ class RoutedExpertsManager:
             Array of shape (num_tokens - token_start, num_layers,
             num_experts_per_tok).
         """
+        slot_mapping = self._get_slot_mapping(block_ids, num_tokens, token_start)
+        return self.routed_experts_by_slot[slot_mapping]
+
+    def get_weights(
+        self,
+        block_ids: list[int],
+        num_tokens: int,
+        token_start: int = 0,
+    ) -> np.ndarray | None:
+        """Read routed expert weights paired with :meth:`get` results."""
+        if self.routed_expert_weights_by_slot is None:
+            return None
+        slot_mapping = self._get_slot_mapping(block_ids, num_tokens, token_start)
+        return self.routed_expert_weights_by_slot[slot_mapping]
+
+    def _get_slot_mapping(
+        self,
+        block_ids: list[int],
+        num_tokens: int,
+        token_start: int,
+    ) -> np.ndarray:
         bs = self.block_size
         block_ids_array = np.array(block_ids, dtype=np.int32)
         block_offsets = np.arange(bs)
-        # slot = block_id * block_size + offset_in_block; flatten the
-        # (num_blocks, block_size) grid and trim to num_tokens, then
-        # skip the first token_start entries so only the requested
-        # range is fetched in a single fancy-index read.
+        # slot = block_id * block_size + offset_in_block.
         slot_mapping = (
             block_ids_array.reshape(-1, 1) * bs + block_offsets.reshape(1, -1)
         ).flatten()[:num_tokens]
-        slot_mapping = slot_mapping[token_start:]
-        return self.routed_experts_by_slot[slot_mapping]
+        return slot_mapping[token_start:]

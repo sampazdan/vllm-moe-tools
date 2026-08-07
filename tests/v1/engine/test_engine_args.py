@@ -49,6 +49,30 @@ def test_prefix_caching_from_cli():
         args = parser.parse_args(["--prefix-caching-hash-algo", "invalid"])
 
 
+def test_moe_expert_selection_profile_from_cli(monkeypatch):
+    from inspect import signature
+    from unittest.mock import patch
+
+    from vllm.entrypoints.llm import LLM
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        ["--moe-expert-selection-profile", "/tmp/expert-profile.json"]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+
+    assert engine_args.moe_expert_selection_profile == "/tmp/expert-profile.json"
+    with patch("vllm.engine.arg_utils.ModelConfig") as model_config_cls:
+        engine_args.create_model_config()
+    assert (
+        model_config_cls.call_args.kwargs["moe_expert_selection_profile"]
+        == "/tmp/expert-profile.json"
+    )
+    assert "moe_expert_selection_profile" in signature(LLM.__init__).parameters
+
+
 @pytest.mark.skipif(_xxhash is None, reason="xxhash not installed")
 def test_prefix_caching_xxhash_from_cli():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())

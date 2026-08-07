@@ -141,6 +141,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             disable CUDA graph and always execute the model in eager mode.
             If False, we will use CUDA graph and eager execution in hybrid.
         enable_return_routed_experts: Whether to return routed experts.
+        moe_expert_selection_profile: Path to a per-layer MoE expert
+            eligibility profile.
         disable_custom_all_reduce: See
             [ParallelConfig][vllm.config.ParallelConfig].
         hf_token: The token to use as HTTP bearer authorization for remote files
@@ -201,6 +203,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         offload_params: set[str] | None = None,
         enforce_eager: bool = False,
         enable_return_routed_experts: bool = False,
+        enable_return_routed_expert_weights: bool = False,
+        moe_expert_selection_profile: str | None = None,
         disable_custom_all_reduce: bool = False,
         hf_token: bool | str | None = None,
         hf_overrides: HfOverrides | None = None,
@@ -317,6 +321,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             offload_params=offload_params or set(),
             enforce_eager=enforce_eager,
             enable_return_routed_experts=enable_return_routed_experts,
+            enable_return_routed_expert_weights=enable_return_routed_expert_weights,
+            moe_expert_selection_profile=moe_expert_selection_profile,
             disable_custom_all_reduce=disable_custom_all_reduce,
             hf_token=hf_token,
             hf_overrides=hf_overrides,

@@ -4,6 +4,7 @@
 import math
 import time
 
+import numpy as np
 import pytest
 
 from tests.v1.engine.utils import (
@@ -22,6 +23,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm.v1.engine import (
     EngineCoreEvent,
     EngineCoreEventType,
+    EngineCoreOutput,
     EngineCoreOutputs,
     EngineCoreRequest,
     FinishReason,
@@ -44,6 +46,44 @@ def _ref_convert_id_to_token(
       String representation of input token id
     """
     return tokenizer.decode([token_id]) or ""
+
+
+def test_routed_expert_weights_are_paired_in_final_output():
+    output_processor = OutputProcessor(
+        None,
+        log_stats=False,
+    )
+    request = EngineCoreRequest(
+        request_id="request-int",
+        external_req_id="request",
+        prompt_token_ids=[1],
+        mm_features=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        sampling_params=SamplingParams(),
+        pooling_params=None,
+    )
+    output_processor.add_request(request, None)
+    routed_experts = np.arange(20, dtype=np.uint8).reshape(5, 2, 2)
+    routed_expert_weights = np.linspace(0.1, 0.9, 20, dtype=np.float32).reshape(5, 2, 2)
+    output = EngineCoreOutput(
+        request_id=request.request_id,
+        new_token_ids=[2],
+        finish_reason=FinishReason.LENGTH,
+        routed_experts=routed_experts,
+        routed_expert_weights=routed_expert_weights,
+    )
+
+    processed = output_processor.process_outputs([output])
+
+    completion = processed.request_outputs[0].outputs[0]
+    np.testing.assert_array_equal(completion.routed_experts, routed_experts)
+    np.testing.assert_array_equal(
+        completion.routed_expert_weights,
+        routed_expert_weights,
+    )
 
 
 @pytest.mark.parametrize(

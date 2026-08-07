@@ -165,6 +165,8 @@ class BaseRouter(FusedMoERouter):
     to the abstract _compute_routing() method.
     """
 
+    supports_expert_eligibility = False
+
     def __init__(
         self,
         top_k: int,
@@ -181,24 +183,61 @@ class BaseRouter(FusedMoERouter):
         self.top_k = top_k
         self.global_num_experts = global_num_experts
         self.capture_fn: Callable[[torch.Tensor], None] | None = None
+        self.capture_weights_fn: Callable[[torch.Tensor, torch.Tensor], None] | None = (
+            None
+        )
         self.expert_eligibility_mask: torch.Tensor | None = None
+        self._expert_ineligibility_mask: torch.Tensor | None = None
 
     def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
         """Set a capture callback for logical routed expert IDs."""
         self.capture_fn = capture_fn
 
-    def set_expert_eligibility_mask(self, mask: torch.Tensor | None) -> None:
+    def set_capture_weights_fn(
+        self,
+        capture_fn: Callable[[torch.Tensor, torch.Tensor], None] | None,
+    ) -> None:
+        """Set a capture callback for paired logical IDs and weights."""
+        self.capture_weights_fn = capture_fn
+
+    def _validate_expert_eligibility_mask(self, mask: torch.Tensor) -> None:
+        if not self.supports_expert_eligibility:
+            raise ValueError(
+                f"expert eligibility is unsupported for {type(self).__name__}"
+            )
+
+    def _expert_eligibility_mask_changed(self) -> None:
+        pass
+
+    def set_expert_eligibility_mask(
+        self,
+        mask: torch.Tensor | None,
+        *,
+        logical_num_experts: int | None = None,
+    ) -> None:
         """Restrict routing to the experts selected by a boolean mask."""
         if mask is not None:
             if mask.dtype != torch.bool or mask.ndim != 1:
                 raise ValueError("expert eligibility mask must be a 1D bool tensor")
-            if mask.numel() != self.global_num_experts:
+            expected_num_experts = (
+                self.global_num_experts
+                if logical_num_experts is None
+                else logical_num_experts
+            )
+            if not 0 < expected_num_experts <= self.global_num_experts:
+                raise ValueError("invalid logical expert count for eligibility mask")
+            if mask.numel() != expected_num_experts:
                 raise ValueError(
-                    "expert eligibility mask size must equal global_num_experts"
+                    "expert eligibility mask size must equal the logical expert count"
                 )
             if int(mask.count_nonzero()) < self.top_k:
                 raise ValueError("expert eligibility mask enables fewer than top_k")
+            self._validate_expert_eligibility_mask(mask)
         self.expert_eligibility_mask = mask
+        self._expert_ineligibility_mask = (
+            torch.logical_not(mask) if mask is not None else None
+        )
+        self._expert_eligibility_mask_changed()
 
     def _validate_eplb_state(self) -> None:
         """Validate that EPLB state is properly initialized if EPLB is enabled."""
@@ -302,9 +341,19 @@ class BaseRouter(FusedMoERouter):
         self._validate_eplb_state()
 
         # Step 2: Compute routing (delegated to subclass)
-        if self.expert_eligibility_mask is not None:
-            mask = self.expert_eligibility_mask.to(router_logits.device)
-            router_logits = router_logits.masked_fill(~mask, float("-inf"))
+        if self._expert_ineligibility_mask is not None:
+            if self._expert_ineligibility_mask.device != router_logits.device:
+                raise RuntimeError(
+                    "expert eligibility mask must be bound on the router device"
+                )
+            logical_num_experts = self._expert_ineligibility_mask.numel()
+            if router_logits.shape[-1] < logical_num_experts:
+                raise RuntimeError(
+                    "router logits have fewer entries than the eligibility mask"
+                )
+            router_logits[..., :logical_num_experts].masked_fill_(
+                self._expert_ineligibility_mask, float("-inf")
+            )
 
         topk_weights, topk_ids = self._compute_routing(
             hidden_states, router_logits, topk_indices_dtype, input_ids=input_ids
@@ -313,6 +362,8 @@ class BaseRouter(FusedMoERouter):
         # Capture logical ids before EPLB mapping.
         if self.capture_fn is not None:
             self.capture_fn(topk_ids)
+        if self.capture_weights_fn is not None:
+            self.capture_weights_fn(topk_ids, topk_weights)
 
         # Step 3: Apply EPLB mapping
         topk_ids = self._apply_eplb_mapping(topk_ids)

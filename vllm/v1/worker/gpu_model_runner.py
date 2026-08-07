@@ -3815,8 +3815,14 @@ class GPUModelRunner(
             # without requiring its own synchronize.
             if self.routed_experts_initialized:
                 buf = self.routed_experts_capturer.get_device_buffer()
+                weight_buf = self.routed_experts_capturer.get_weight_device_buffer()
                 total = scheduler_output.total_num_scheduled_tokens
                 self.routed_experts_cpu[:total].copy_(buf[:total], non_blocking=True)
+                if weight_buf is not None:
+                    assert self.routed_expert_weights_cpu is not None
+                    self.routed_expert_weights_cpu[:total].copy_(
+                        weight_buf[:total], non_blocking=True
+                    )
                 self.routed_experts_slot_mapping_cpu[:total].copy_(
                     self.routed_experts_slot_mapping_device[:total],
                     non_blocking=True,
@@ -4826,6 +4832,9 @@ class GPUModelRunner(
                 output.routed_experts = RoutedExpertsLists(
                     routing_data=self.routed_experts_cpu[:total].numpy(),
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
+                    routing_weights=self.routed_expert_weights_cpu[:total].numpy()
+                    if self.routed_expert_weights_cpu is not None
+                    else None,
                 )
             return output
 
@@ -7708,15 +7717,22 @@ class GPUModelRunner(
             return None
 
         device_buffer = self.routed_experts_capturer.get_device_buffer()
+        weight_device_buffer = self.routed_experts_capturer.get_weight_device_buffer()
         return RoutedExpertsTensors(
             routing_data=device_buffer[:num_tokens].clone(),
             slot_mapping=self.routed_experts_slot_mapping_device[:num_tokens].clone(),
+            routing_weights=weight_device_buffer[:num_tokens].clone()
+            if weight_device_buffer is not None
+            else None,
         )
 
     def init_routed_experts_capturer(self):
         logger.info(
-            "Initializing routed experts capturer, enable_return_routed_experts: %s",
+            "Initializing routed experts capturer, "
+            "enable_return_routed_experts: %s, "
+            "enable_return_routed_expert_weights: %s",
             self.model_config.enable_return_routed_experts,
+            self.model_config.enable_return_routed_expert_weights,
         )
         self.routed_experts_capturer = RoutedExpertsCapturer(
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
@@ -7733,6 +7749,17 @@ class GPUModelRunner(
             dtype=self.routed_experts_capturer.device_buffer.dtype,
             device="cpu",
             pin_memory=PIN_MEMORY,
+        )
+        weight_device_buffer = self.routed_experts_capturer.get_weight_device_buffer()
+        self.routed_expert_weights_cpu = (
+            torch.empty(
+                weight_device_buffer.shape,
+                dtype=weight_device_buffer.dtype,
+                device="cpu",
+                pin_memory=PIN_MEMORY,
+            )
+            if weight_device_buffer is not None
+            else None
         )
         # ``slot_mapping`` dtype is fixed to int64 by
         # ``block_table.slot_mapping``; we mirror that here.

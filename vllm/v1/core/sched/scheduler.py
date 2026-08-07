@@ -338,6 +338,9 @@ class Scheduler(SchedulerInterface):
         self.enable_return_routed_experts = (
             vllm_config.model_config.enable_return_routed_experts
         )
+        self.enable_return_routed_expert_weights = (
+            vllm_config.model_config.enable_return_routed_expert_weights
+        )
 
         if self.enable_return_routed_experts:
             assert self.dcp_world_size == 1 and self.pcp_world_size == 1, (
@@ -1719,14 +1722,20 @@ class Scheduler(SchedulerInterface):
         # requests may terminate on tokens generated in this very step,
         # whose routing was just D2H'd into model_runner_output.
         routing_data = None
+        routing_weights = None
         routing_offsets: dict[str, int] = {}
         if model_runner_output.routed_experts is not None:
             re = model_runner_output.routed_experts
-            self.routed_experts_mgr.store_batch(re.routing_data, re.slot_mapping)
+            self.routed_experts_mgr.store_batch(
+                re.routing_data,
+                re.slot_mapping,
+                re.routing_weights,
+            )
             routing_data = re.routing_data.astype(
                 self.routed_experts_mgr.routed_experts_by_slot.dtype,
                 copy=False,
             )
+            routing_weights = re.routing_weights
             # Build offset map using model runner's request order
             # (input_batch ordering), NOT scheduler dict order.
             offset = 0
@@ -1863,6 +1872,7 @@ class Scheduler(SchedulerInterface):
                     stopped = True
 
             routed_experts = None
+            routed_expert_weights = None
             if (
                 self.enable_return_routed_experts
                 and routing_data is not None
@@ -1891,6 +1901,11 @@ class Scheduler(SchedulerInterface):
                         request.num_prompt_tokens,
                         token_start=prompt_start,
                     )
+                    routed_expert_weights = self.routed_experts_mgr.get_weights(
+                        block_ids,
+                        request.num_prompt_tokens,
+                        token_start=prompt_start,
+                    )
                 else:
                     if scheduled_spec_token_ids:
                         # Spec decode: accepted tokens at the START of
@@ -1898,9 +1913,17 @@ class Scheduler(SchedulerInterface):
                         routed_experts = routing_data[
                             req_offset : req_offset + len(new_token_ids)
                         ]
+                        if routing_weights is not None:
+                            routed_expert_weights = routing_weights[
+                                req_offset : req_offset + len(new_token_ids)
+                            ]
                     else:
                         # Normal decode / re-prefill: token(s) at the END.
                         routed_experts = routing_data[end - len(new_token_ids) : end]
+                        if routing_weights is not None:
+                            routed_expert_weights = routing_weights[
+                                end - len(new_token_ids) : end
+                            ]
 
             should_emit_output = bool(
                 new_token_ids or pooler_output is not None or stopped
@@ -1956,6 +1979,7 @@ class Scheduler(SchedulerInterface):
                         ec_transfer_params=ec_transfer_params,
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
+                        routed_expert_weights=routed_expert_weights,
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )

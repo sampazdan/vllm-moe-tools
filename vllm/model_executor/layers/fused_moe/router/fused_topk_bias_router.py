@@ -293,6 +293,8 @@ def fused_topk_bias(
 class FusedTopKBiasRouter(BaseRouter):
     """Router using fused top-k with e_score_correction_bias."""
 
+    supports_expert_eligibility = True
+
     def __init__(
         self,
         top_k: int,
@@ -323,6 +325,33 @@ class FusedTopKBiasRouter(BaseRouter):
         # ``shared_expert_weight``, AFTER the routed top-k is renormalized.
         self.num_fused_shared_experts = num_fused_shared_experts
         self.shared_expert_weight = shared_expert_weight
+        self._eligibility_correction_bias: torch.Tensor | None = None
+
+    def _validate_expert_eligibility_mask(self, mask: torch.Tensor) -> None:
+        super()._validate_expert_eligibility_mask(mask)
+        if self._hash_indices_table is not None:
+            raise ValueError("expert eligibility is unsupported for hash-based routing")
+        if (
+            self.e_score_correction_bias is not None
+            and self.e_score_correction_bias.numel() != mask.numel()
+        ):
+            raise ValueError(
+                "expert eligibility mask size must match the correction bias"
+            )
+
+    def _expert_eligibility_mask_changed(self) -> None:
+        self._eligibility_correction_bias = None
+        if (
+            self.e_score_correction_bias is None
+            or self._expert_ineligibility_mask is None
+        ):
+            return
+        self._eligibility_correction_bias = (
+            self.e_score_correction_bias.detach().clone()
+        )
+        self._eligibility_correction_bias.masked_fill_(
+            self._expert_ineligibility_mask, float("-inf")
+        )
 
     @property
     def routing_method_type(self) -> RoutingMethodType:
@@ -344,12 +373,17 @@ class FusedTopKBiasRouter(BaseRouter):
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute routing using fused top-k with bias."""
+        correction_bias = (
+            self._eligibility_correction_bias
+            if self._eligibility_correction_bias is not None
+            else self.e_score_correction_bias
+        )
         topk_weights, topk_ids = fused_topk_bias(
             hidden_states=hidden_states,
             gating_output=router_logits,
             scoring_func=self.scoring_func,
-            e_score_correction_bias=self.e_score_correction_bias.data
-            if self.e_score_correction_bias is not None
+            e_score_correction_bias=correction_bias.data
+            if correction_bias is not None
             else None,
             topk=self.top_k,
             renormalize=self.renormalize,

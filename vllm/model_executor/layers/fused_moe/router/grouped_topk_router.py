@@ -246,6 +246,8 @@ class GroupedTopk(CustomOp):
 class GroupedTopKRouter(BaseRouter):
     """Router using grouped top-k routing (e.g., DeepSeekV2/V3)."""
 
+    supports_expert_eligibility = True
+
     def __init__(
         self,
         top_k: int,
@@ -271,6 +273,55 @@ class GroupedTopKRouter(BaseRouter):
         self.routed_scaling_factor = routed_scaling_factor
         self.e_score_correction_bias = e_score_correction_bias
         self.num_fused_shared_experts = num_fused_shared_experts
+        self._eligibility_correction_bias: torch.Tensor | None = None
+
+    def _validate_expert_eligibility_mask(self, mask: torch.Tensor) -> None:
+        super()._validate_expert_eligibility_mask(mask)
+        if (
+            self.e_score_correction_bias is not None
+            and self.e_score_correction_bias.numel() != mask.numel()
+        ):
+            raise ValueError(
+                "expert eligibility mask size must match the correction bias"
+            )
+        num_experts = mask.numel()
+        if (
+            num_experts <= self.num_expert_group
+            or num_experts % self.num_expert_group != 0
+        ):
+            return
+        eligible_per_group = mask.reshape(self.num_expert_group, -1).sum(dim=1)
+        active_counts = eligible_per_group[eligible_per_group > 0]
+        if self.e_score_correction_bias is not None and torch.any(active_counts < 2):
+            raise ValueError(
+                "biased grouped routing requires at least two eligible experts "
+                "in every enabled group"
+            )
+        if active_counts.numel() <= self.topk_group:
+            minimum_selected = active_counts.sum()
+        else:
+            minimum_selected = active_counts.topk(
+                self.topk_group, largest=False
+            ).values.sum()
+        if int(minimum_selected) < self.top_k:
+            raise ValueError(
+                "grouped routing cannot guarantee top_k eligible experts in "
+                "every selected group set"
+            )
+
+    def _expert_eligibility_mask_changed(self) -> None:
+        self._eligibility_correction_bias = None
+        if (
+            self.e_score_correction_bias is None
+            or self._expert_ineligibility_mask is None
+        ):
+            return
+        self._eligibility_correction_bias = (
+            self.e_score_correction_bias.detach().clone()
+        )
+        self._eligibility_correction_bias.masked_fill_(
+            self._expert_ineligibility_mask, float("-inf")
+        )
 
     @property
     def routing_method_type(self) -> RoutingMethodType:
@@ -293,6 +344,12 @@ class GroupedTopKRouter(BaseRouter):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute routing using grouped top-k."""
 
+        correction_bias = (
+            self._eligibility_correction_bias
+            if self._eligibility_correction_bias is not None
+            else self.e_score_correction_bias
+        )
+
         def valid_grouping() -> bool:
             # Check if num_experts is greater than num_expert_group
             # and is divisible by num_expert_group
@@ -302,12 +359,12 @@ class GroupedTopKRouter(BaseRouter):
             return num_experts % self.num_expert_group == 0
 
         if not valid_grouping():
-            if self.e_score_correction_bias is not None:
+            if correction_bias is not None:
                 topk_weights, topk_ids = fused_topk_bias(
                     hidden_states=hidden_states,
                     gating_output=router_logits,
                     scoring_func=self.scoring_func,
-                    e_score_correction_bias=self.e_score_correction_bias.data,
+                    e_score_correction_bias=correction_bias.data,
                     topk=self.top_k,
                     renormalize=self.renormalize,
                 )
@@ -343,7 +400,7 @@ class GroupedTopKRouter(BaseRouter):
             topk_group=self.topk_group,
             scoring_func=self.scoring_func,
             routed_scaling_factor=self.routed_scaling_factor,
-            e_score_correction_bias=self.e_score_correction_bias,
+            e_score_correction_bias=correction_bias,
         )
 
         return topk_weights, topk_ids
