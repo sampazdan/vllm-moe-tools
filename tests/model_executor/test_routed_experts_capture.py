@@ -11,6 +11,9 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.config.compilation import CompilationMode
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+from vllm.model_executor.layers.fused_moe.expert_selection import (
+    ExpertSelectionProfile,
+)
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     RoutedExpertsManager,
@@ -195,6 +198,53 @@ def test_base_router_capture_with_eplb_enabled():
     assert torch.equal(captured[0], torch.tensor([[1, 2], [3, 4]]))
     # Our DummyRouter mapping adds +10.
     assert torch.equal(topk_ids, torch.tensor([[11, 12], [13, 14]]))
+
+
+def test_base_router_eligibility_is_applied_before_topk():
+    class TopKRouter(DummyRouter):
+        def _compute_routing(
+            self, hidden_states, router_logits, indices_type, *, input_ids=None
+        ):
+            return torch.topk(router_logits, self.top_k)
+
+        def _apply_eplb_mapping(self, topk_ids):
+            return topk_ids
+
+    router = TopKRouter(top_k=2, global_num_experts=4)
+    router.set_expert_eligibility_mask(torch.tensor([True, True, False, False]))
+    weights, ids = router.select_experts(
+        hidden_states=torch.empty(1),
+        router_logits=torch.tensor([[1.0, 2.0, 100.0, 200.0]]),
+    )
+
+    assert ids.tolist() == [[1, 0]]
+    assert weights.tolist() == [[2.0, 1.0]]
+
+
+def test_base_router_rejects_too_few_eligible_experts():
+    router = _make_router()
+
+    with pytest.raises(ValueError, match="fewer than top_k"):
+        router.set_expert_eligibility_mask(
+            torch.tensor([True] + [False] * 15, dtype=torch.bool)
+        )
+
+
+def test_expert_selection_profile_normalizes_and_rejects_duplicates(tmp_path):
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(
+        '{"version": 1, "layers": {"2": {"keep": [0, 3]}}}',
+        encoding="utf-8",
+    )
+    profile = ExpertSelectionProfile.from_file(profile_path)
+    assert profile.layers == {2: frozenset({0, 3})}
+
+    profile_path.write_text(
+        '{"version": 1, "layers": {"2": {"keep": [3, 3]}}}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="duplicate expert IDs"):
+        ExpertSelectionProfile.from_file(profile_path)
 
 
 def test_public_binding_only_visits_target_model(monkeypatch):
