@@ -181,10 +181,24 @@ class BaseRouter(FusedMoERouter):
         self.top_k = top_k
         self.global_num_experts = global_num_experts
         self.capture_fn: Callable[[torch.Tensor], None] | None = None
+        self.expert_eligibility_mask: torch.Tensor | None = None
 
     def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
         """Set a capture callback for logical routed expert IDs."""
         self.capture_fn = capture_fn
+
+    def set_expert_eligibility_mask(self, mask: torch.Tensor | None) -> None:
+        """Restrict routing to the experts selected by a boolean mask."""
+        if mask is not None:
+            if mask.dtype != torch.bool or mask.ndim != 1:
+                raise ValueError("expert eligibility mask must be a 1D bool tensor")
+            if mask.numel() != self.global_num_experts:
+                raise ValueError(
+                    "expert eligibility mask size must equal global_num_experts"
+                )
+            if int(mask.count_nonzero()) < self.top_k:
+                raise ValueError("expert eligibility mask enables fewer than top_k")
+        self.expert_eligibility_mask = mask
 
     def _validate_eplb_state(self) -> None:
         """Validate that EPLB state is properly initialized if EPLB is enabled."""
@@ -288,6 +302,10 @@ class BaseRouter(FusedMoERouter):
         self._validate_eplb_state()
 
         # Step 2: Compute routing (delegated to subclass)
+        if self.expert_eligibility_mask is not None:
+            mask = self.expert_eligibility_mask.to(router_logits.device)
+            router_logits = router_logits.masked_fill(~mask, float("-inf"))
+
         topk_weights, topk_ids = self._compute_routing(
             hidden_states, router_logits, topk_indices_dtype, input_ids=input_ids
         )

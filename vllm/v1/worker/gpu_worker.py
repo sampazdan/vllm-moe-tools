@@ -442,6 +442,15 @@ class Worker(WorkerBase):
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
+        if profile_path := self.model_config.moe_expert_selection_profile:
+            from vllm.model_executor.layers.fused_moe.expert_selection import (
+                ExpertSelectionProfile,
+                bind_expert_selection_profile,
+            )
+
+            profile = ExpertSelectionProfile.from_file(profile_path)
+            bind_expert_selection_profile(self.model_runner.get_model(), profile)
+
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
                 self.vllm_config.weight_transfer_config,

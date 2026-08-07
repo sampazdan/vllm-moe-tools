@@ -425,6 +425,9 @@ class EngineArgs:
 
     model: str = ModelConfig.model
     enable_return_routed_experts: bool = ModelConfig.enable_return_routed_experts
+    moe_expert_selection_profile: str | None = (
+        ModelConfig.moe_expert_selection_profile
+    )
     model_weights: str = ModelConfig.model_weights
     served_model_name: str | list[str] | None = ModelConfig.served_model_name
     tokenizer: str | None = ModelConfig.tokenizer
@@ -1738,6 +1741,7 @@ class EngineArgs:
             allow_deprecated_quantization=self.allow_deprecated_quantization,
             enforce_eager=self.enforce_eager,
             enable_return_routed_experts=self.enable_return_routed_experts,
+            moe_expert_selection_profile=self.moe_expert_selection_profile,
             max_logprobs=self.max_logprobs,
             logprobs_mode=self.logprobs_mode,
             use_fp64_gumbel=self.use_fp64_gumbel,
