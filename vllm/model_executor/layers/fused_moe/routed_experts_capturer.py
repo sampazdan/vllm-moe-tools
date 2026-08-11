@@ -472,7 +472,7 @@ class RoutedExpertsManager:
                 ``[0, num_tokens]`` automatically.
 
         Returns:
-            Array of shape (num_tokens - token_start, num_layers,
+            Array of shape (max(num_tokens - token_start, 0), num_layers,
             num_experts_per_tok).
         """
         slot_mapping = self._get_slot_mapping(block_ids, num_tokens, token_start)

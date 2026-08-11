@@ -29,7 +29,10 @@ from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.scheduler import (
+    Scheduler,
+    _clamp_routed_experts_prompt_start,
+)
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
@@ -197,6 +200,18 @@ def test_scheduler_stats_route_to_existing_output_client():
     assert 0 not in engine_core_outputs
     assert engine_core_outputs[1].scheduler_stats is not None
     assert len(engine_core_outputs[1].outputs) == 1
+
+
+@pytest.mark.parametrize(
+    ("prompt_start", "expected"),
+    [(10, 10), (1000, 10)],
+)
+@pytest.mark.skip_global_cleanup
+def test_routed_experts_prompt_start_clamps_to_prompt_length(
+    prompt_start: int,
+    expected: int,
+):
+    assert _clamp_routed_experts_prompt_start(prompt_start, 10) == expected
 
 
 def test_schedule_multimodal_requests():

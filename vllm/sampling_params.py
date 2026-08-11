@@ -335,8 +335,8 @@ class SamplingParams(
     routed_experts_prompt_start prompt tokens from the returned routing
     data. In multi-turn agent scenarios, set this to the length of the
     already-returned prefix to avoid duplicating routing for prompt tokens
-    covered by earlier turns. Default 0 returns routing for all prompt
-    tokens."""
+    covered by earlier turns. Values at or beyond the prompt length skip all
+    prompt routing. Default 0 returns routing for all prompt tokens."""
 
     # Fields used for bad words
     bad_words: list[str] | None = None
@@ -390,6 +390,7 @@ class SamplingParams(
         skip_clone: bool = False,
         repetition_detection: RepetitionDetectionParams | None = None,
         logprob_token_ids: list[int] | None = None,
+        routed_experts_prompt_start: int = 0,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Fast path uses a dict comprehension; on failure we iterate once
@@ -450,6 +451,7 @@ class SamplingParams(
             logit_bias=logit_bias,
             allowed_token_ids=allowed_token_ids,
             extra_args=extra_args,
+            routed_experts_prompt_start=routed_experts_prompt_start,
             skip_clone=skip_clone,
             repetition_detection=repetition_detection,
         )
@@ -593,6 +595,16 @@ class SamplingParams(
             raise VLLMValidationError(
                 f"min_tokens must be less than or equal to "
                 f"max_tokens={self.max_tokens}, got {self.min_tokens}."
+            )
+        if not isinstance(self.routed_experts_prompt_start, int):
+            raise VLLMValidationError(
+                "routed_experts_prompt_start must be an integer, got "
+                f"{type(self.routed_experts_prompt_start).__name__}."
+            )
+        if self.routed_experts_prompt_start < 0:
+            raise VLLMValidationError(
+                "routed_experts_prompt_start must be non-negative, got "
+                f"{self.routed_experts_prompt_start}."
             )
         if self.stream_interval is not None and self.stream_interval < 1:
             raise VLLMValidationError(
