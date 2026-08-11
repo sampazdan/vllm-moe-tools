@@ -1028,6 +1028,21 @@ def test_chat_completion_request_accepts_model_specific_reasoning_effort():
     assert chat_params.chat_template_kwargs["reasoning_effort"] == "max"
 
 
+def test_chat_completion_request_forwards_routed_experts_prompt_start():
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "Continue"}],
+        routed_experts_prompt_start=37,
+    )
+
+    sampling_params = request.to_sampling_params(
+        max_tokens=10,
+        default_sampling_params={},
+    )
+
+    assert sampling_params.routed_experts_prompt_start == 37
+
+
 def test_chat_completion_request_rejects_unknown_reasoning_effort():
     with pytest.raises(ValueError, match="Input should be"):
         ChatCompletionRequest(

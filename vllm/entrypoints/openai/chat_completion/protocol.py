@@ -285,6 +285,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ),
     )
     prompt_logprobs: int | None = None
+    routed_experts_prompt_start: Annotated[int, Field(ge=0, le=_INT64_MAX)] = 0
+    """Skip an already-returned prompt prefix in routed-expert telemetry.
+
+    Values at or beyond the prompt length skip all prompt routing.
+    """
     logprob_token_ids: list[int] | None = Field(
         default=None,
         description=(
@@ -739,6 +744,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             bad_words=self.bad_words,
             thinking_token_budget=self.thinking_token_budget,
             allowed_token_ids=self.allowed_token_ids,
+            routed_experts_prompt_start=self.routed_experts_prompt_start,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
             repetition_detection=self.repetition_detection,

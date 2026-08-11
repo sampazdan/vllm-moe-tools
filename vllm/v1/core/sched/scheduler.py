@@ -66,6 +66,13 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+def _clamp_routed_experts_prompt_start(
+    prompt_start: int,
+    num_prompt_tokens: int,
+) -> int:
+    return min(prompt_start, num_prompt_tokens)
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -1893,7 +1900,10 @@ class Scheduler(SchedulerInterface):
                         prompt_start = (
                             request.sampling_params.routed_experts_prompt_start
                         )
-                        assert prompt_start < request.num_prompt_tokens
+                        prompt_start = _clamp_routed_experts_prompt_start(
+                            prompt_start,
+                            request.num_prompt_tokens,
+                        )
                     else:
                         prompt_start = 0
                     routed_experts = self.routed_experts_mgr.get(
