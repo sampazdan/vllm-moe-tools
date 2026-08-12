@@ -101,7 +101,9 @@ RUNPOD_VLLM_REVISION=95a723d08a9490559dae23d0cff1d9466213d989 \
   runpod-serve
 ```
 
-The wrapper passes this value through `--revision` and records it in
+The wrapper binds both `--revision` and `--tokenizer-revision` to this value,
+then preflights the pinned config and fast tokenizer into the Hugging Face cache
+before vLLM starts. It records the revision in
 `/workspace/logs/vllm-server-config.txt`.
 
 Set `RUNPOD_CAPTURE_ROUTING=1` when routed-expert IDs and weights are needed.

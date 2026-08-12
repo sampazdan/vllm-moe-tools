@@ -17,6 +17,8 @@ max_num_batched_tokens="${RUNPOD_VLLM_MAX_NUM_BATCHED_TOKENS:-2048}"
 max_num_seqs="${RUNPOD_VLLM_MAX_NUM_SEQS:-8}"
 enable_request_metrics="${RUNPOD_ENABLE_REQUEST_METRICS:-1}"
 reasoning_parser="${RUNPOD_REASONING_PARSER:-qwen3}"
+preflight_python="${RUNPOD_VLLM_PREFLIGHT_PYTHON:-/opt/vllm-venv/bin/python}"
+preflight_timeout="${RUNPOD_VLLM_PREFLIGHT_TIMEOUT_SECONDS:-300}"
 
 require_integer() {
     local name="$1"
@@ -50,6 +52,11 @@ require_integer \
     1 \
     10000000
 require_integer RUNPOD_VLLM_MAX_NUM_SEQS "${max_num_seqs}" 1 4096
+require_integer \
+    RUNPOD_VLLM_PREFLIGHT_TIMEOUT_SECONDS \
+    "${preflight_timeout}" \
+    30 \
+    900
 if [[ ! "${gpu_memory_utilization}" =~ ^(0\.[0-9]*[1-9][0-9]*|1(\.0+)?)$ ]]; then
     echo "RUNPOD_VLLM_GPU_MEMORY_UTILIZATION must be greater than 0 and at most 1." >&2
     exit 2
@@ -61,6 +68,10 @@ fi
 if [[ "${RUNPOD_CAPTURE_ROUTING:-0}" != "0" \
     && "${RUNPOD_CAPTURE_ROUTING:-0}" != "1" ]]; then
     echo "RUNPOD_CAPTURE_ROUTING must be 0 or 1." >&2
+    exit 2
+fi
+if [[ -n "${revision}" && ! -x "${preflight_python}" ]]; then
+    echo "Tokenizer preflight Python is not executable: ${preflight_python}" >&2
     exit 2
 fi
 
@@ -75,7 +86,10 @@ args=(
 )
 
 if [[ -n "${revision}" ]]; then
-    args+=(--revision "${revision}")
+    args+=(
+        --revision "${revision}"
+        --tokenizer-revision "${revision}"
+    )
 fi
 
 if [[ "${enable_request_metrics}" == "1" ]]; then
@@ -99,6 +113,32 @@ if [[ "${RUNPOD_CAPTURE_ROUTING:-0}" == "1" ]]; then
         --enable-return-routed-experts
         --enable-return-routed-expert-weights
     )
+fi
+
+if [[ -n "${revision}" ]]; then
+    timeout \
+        --signal=TERM \
+        --kill-after=10s \
+        "${preflight_timeout}s" \
+        "${preflight_python}" - "${model}" "${revision}" <<'PY'
+import sys
+
+from transformers import AutoConfig, AutoTokenizer
+
+model, revision = sys.argv[1:]
+config = AutoConfig.from_pretrained(model, revision=revision)
+if not getattr(config, "model_type", None):
+    raise RuntimeError("the pinned model config has no model_type")
+tokenizer = AutoTokenizer.from_pretrained(
+    model,
+    revision=revision,
+    config=config,
+)
+if not tokenizer.is_fast:
+    raise RuntimeError("the pinned model did not resolve a fast tokenizer")
+tokenizer.encode("tokenizer preflight", add_special_tokens=False)
+print(f"Validated pinned model and tokenizer metadata for {model}@{revision}.")
+PY
 fi
 
 mkdir -p /workspace/logs
