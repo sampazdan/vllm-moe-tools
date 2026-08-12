@@ -654,7 +654,7 @@ class Worker(WorkerBase):
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
-            self.model_runner.profile_run()
+            self._profile_run_with_compile_progress()
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -681,7 +681,7 @@ class Worker(WorkerBase):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
-            self.model_runner.profile_run()
+            self._profile_run_with_compile_progress()
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
@@ -789,6 +789,19 @@ class Worker(WorkerBase):
             self.model_config.multimodal_config,
             getattr(self.parallel_config, "_api_process_count", 1),
         )
+
+    def _profile_run_with_compile_progress(self) -> None:
+        progress = (
+            model_load_progress(
+                "compiling",
+                "Preparing compiled model artifacts during initial execution profiling",
+                owner=self,
+            )
+            if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
+            else nullcontext()
+        )
+        with progress:
+            self.model_runner.profile_run()
 
     def get_kv_connector_handshake_metadata(
         self,
@@ -1040,33 +1053,14 @@ class Worker(WorkerBase):
 
     def _run_startup_compile_warmups(self, warmup_sizes: list[int]) -> None:
         ordered_sizes = sorted(warmup_sizes, reverse=True)
-        report_progress = (
-            bool(ordered_sizes)
-            and self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
-        )
-        progress_detail = (
-            "Preparing and validating configured AOT startup model artifacts"
-            if envs.VLLM_USE_AOT_COMPILE
-            else "Compiling configured startup model shapes"
-        )
-        progress = (
-            model_load_progress(
-                "compiling",
-                progress_detail,
-                owner=self,
+        # We skip EPLB here since we don't want to record dummy metrics.
+        for size in ordered_sizes:
+            logger.info("Compile and warming up model for size %d", size)
+            self.model_runner._dummy_run(
+                size,
+                skip_eplb=True,
+                remove_lora=False,
             )
-            if report_progress
-            else nullcontext()
-        )
-        with progress:
-            # We skip EPLB here since we don't want to record dummy metrics.
-            for size in ordered_sizes:
-                logger.info("Compile and warming up model for size %d", size)
-                self.model_runner._dummy_run(
-                    size,
-                    skip_eplb=True,
-                    remove_lora=False,
-                )
 
     def reset_mm_cache(self) -> None:
         self.model_runner.reset_mm_cache()

@@ -173,7 +173,9 @@ def test_phase_decorator_reports_only_when_real_boundary_is_enabled(
     ]
 
 
-def test_startup_compile_phase_completes_after_all_configured_shapes(
+@pytest.mark.parametrize("aot_enabled", [False, True], ids=["regular", "aot"])
+def test_compile_phase_tracks_initial_profile_run_only(
+    aot_enabled: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sequence: list[tuple[str, int | str]] = []
@@ -190,6 +192,9 @@ def test_startup_compile_phase_completes_after_all_configured_shapes(
 
     class Runner:
         lora_config = None
+
+        def profile_run(self) -> None:
+            sequence.append(("profile", "run"))
 
         def _dummy_run(
             self,
@@ -210,54 +215,37 @@ def test_startup_compile_phase_completes_after_all_configured_shapes(
         model_runner=Runner(),
     )
     monkeypatch.setattr(gpu_worker, "model_load_progress", record)
-    monkeypatch.setenv("VLLM_USE_AOT_COMPILE", "0")
+    monkeypatch.setenv("VLLM_USE_AOT_COMPILE", str(int(aot_enabled)))
 
+    gpu_worker.Worker._profile_run_with_compile_progress(worker)
     gpu_worker.Worker._run_startup_compile_warmups(worker, [4, 8])
 
     assert sequence == [
         ("compiling", "started"),
+        ("profile", "run"),
+        ("compiling", "completed"),
         ("shape", 8),
         ("shape", 4),
-        ("compiling", "completed"),
-    ]
-    assert progress_events == [
-        ("compiling", "started", "Compiling configured startup model shapes"),
-        ("compiling", "completed", "Compiling configured startup model shapes"),
-    ]
-
-    sequence.clear()
-    progress_events.clear()
-    monkeypatch.setenv("VLLM_USE_AOT_COMPILE", "1")
-    gpu_worker.Worker._run_startup_compile_warmups(worker, [4, 8])
-    assert sequence == [
-        ("compiling", "started"),
-        ("shape", 8),
-        ("shape", 4),
-        ("compiling", "completed"),
     ]
     assert progress_events == [
         (
             "compiling",
             "started",
-            "Preparing and validating configured AOT startup model artifacts",
+            "Preparing compiled model artifacts during initial execution profiling",
         ),
         (
             "compiling",
             "completed",
-            "Preparing and validating configured AOT startup model artifacts",
+            "Preparing compiled model artifacts during initial execution profiling",
         ),
     ]
 
     sequence.clear()
     progress_events.clear()
-    monkeypatch.setenv("VLLM_USE_AOT_COMPILE", "0")
-    gpu_worker.Worker._run_startup_compile_warmups(worker, [])
-    assert sequence == []
-    assert progress_events == []
-
     worker.vllm_config.compilation_config.mode = CompilationMode.NONE
+    gpu_worker.Worker._profile_run_with_compile_progress(worker)
     gpu_worker.Worker._run_startup_compile_warmups(worker, [4, 8])
-    assert sequence == [("shape", 8), ("shape", 4)]
+    assert sequence == [("profile", "run"), ("shape", 8), ("shape", 4)]
     assert progress_events == []
 
 
