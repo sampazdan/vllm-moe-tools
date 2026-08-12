@@ -3,18 +3,44 @@
 
 
 import tempfile
+from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import pytest
-from huggingface_hub import _CACHED_NO_EXIST
+from huggingface_hub import _CACHED_NO_EXIST, ResolvedRevision
 
 from vllm.transformers_utils.repo_utils import (
     any_pattern_in_repo_files,
     get_hf_file_to_dict,
     is_mistral_model_repo,
     list_filtered_repo_files,
+    resolve_revision,
 )
+
+
+@pytest.mark.skip_global_cleanup
+def test_resolve_revision_preserves_commit_across_process_serialization() -> None:
+    commit_hash = "1" * 40
+    api = MagicMock()
+    api.resolve_revision.return_value = ResolvedRevision(
+        resolved=commit_hash,
+        initial=commit_hash,
+    )
+
+    with patch("vllm.transformers_utils.repo_utils.hf_api", return_value=api):
+        revision = resolve_revision("example/model", commit_hash)
+
+    config_revisions = {
+        "revision": revision,
+        "tokenizer_revision": revision,
+    }
+    assert type(revision) is str
+    serialized = ForkingPickler.dumps(config_revisions)
+    assert ForkingPickler.loads(serialized) == {
+        "revision": commit_hash,
+        "tokenizer_revision": commit_hash,
+    }
 
 
 @pytest.mark.parametrize(

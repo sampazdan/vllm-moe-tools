@@ -73,6 +73,17 @@ def _clamp_routed_experts_prompt_start(
     return min(prompt_start, num_prompt_tokens)
 
 
+def _resolve_expert_context_fingerprint(
+    fingerprints: Iterable[str | None],
+) -> str | None:
+    unique = set(fingerprints)
+    if len(unique) > 1:
+        raise RuntimeError(
+            "one scheduler step cannot mix requests from different expert contexts"
+        )
+    return next(iter(unique)) if unique else None
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -1224,6 +1235,11 @@ class Scheduler(SchedulerInterface):
                 scheduled_encoder_inputs
             )
 
+        expert_context_fingerprint = _resolve_expert_context_fingerprint(
+            self.requests[request_id].expert_context_fingerprint
+            for request_id in num_scheduled_tokens
+        )
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1240,6 +1256,7 @@ class Scheduler(SchedulerInterface):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            expert_context_fingerprint=expert_context_fingerprint,
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             kv_cache_block_copies=pending_kv_cache_block_copies,
             partial_tail_offloads=pending_partial_tail_offloads,
@@ -1990,6 +2007,7 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         routed_expert_weights=routed_expert_weights,
+                        expert_context_fingerprint=(request.expert_context_fingerprint),
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )
@@ -2022,6 +2040,7 @@ class Scheduler(SchedulerInterface):
                         finish_reason=request.get_finished_reason(),
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
+                        expert_context_fingerprint=(request.expert_context_fingerprint),
                     )
                 )
 
@@ -2545,6 +2564,12 @@ class Scheduler(SchedulerInterface):
         stale vision embeddings are not reused.
         """
         self.encoder_cache_manager.reset()
+
+    def reset_routed_experts_cache(self) -> None:
+        """Invalidate routing telemetry associated with KV-cache slots."""
+        if self.enable_return_routed_experts:
+            self.routed_experts_mgr.reset()
+            self._re_block_ids.clear()
 
     def make_stats(
         self,

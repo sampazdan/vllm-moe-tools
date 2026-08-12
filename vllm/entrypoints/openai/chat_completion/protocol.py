@@ -123,6 +123,7 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     routed_experts: str | None = None
     # Weights paired elementwise with ``routed_experts``, encoded identically.
     routed_expert_weights: str | None = None
+    expert_context_fingerprint: str | None = None
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -148,6 +149,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
         default=None, description="ECTransfer parameters."
     )
     metrics: PerRequestTimingMetrics | None = None
+    expert_context_fingerprint: str | None = None
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
@@ -180,6 +182,12 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     # ``return_prompt_text=True`` on the request); only sent on the first chunk.
     prompt_text: str | None = None
     metrics: PerRequestTimingMetrics | None = None
+    expert_context_fingerprint: str | None = None
+    # Final usage-chunk telemetry for single-choice streams. These mirror the
+    # fields on ``ChatCompletionResponseChoice`` without repeating the arrays
+    # on every token chunk.
+    routed_experts: str | None = None
+    routed_expert_weights: str | None = None
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):

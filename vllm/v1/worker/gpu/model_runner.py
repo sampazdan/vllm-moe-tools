@@ -46,6 +46,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_load_progress import track_model_load_phase
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.encoder_budget import (
     MultiModalBudget,
@@ -777,6 +778,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return 0
 
     @torch.inference_mode()
+    @track_model_load_phase(
+        "capturing_graphs",
+        "Capturing configured CUDA graphs for the model runner",
+        enabled_when=lambda runner: (
+            not runner.is_encoder_only
+            and runner.cudagraph_manager is not None
+            and runner.cudagraph_manager.needs_capture()
+        ),
+    )
     def capture_model(self) -> int:
         if self.is_encoder_only:
             return 0

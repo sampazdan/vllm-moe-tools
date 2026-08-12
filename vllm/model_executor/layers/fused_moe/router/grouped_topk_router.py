@@ -310,15 +310,17 @@ class GroupedTopKRouter(BaseRouter):
             )
 
     def _expert_eligibility_mask_changed(self) -> None:
-        self._eligibility_correction_bias = None
         if (
             self.e_score_correction_bias is None
             or self._expert_ineligibility_mask is None
         ):
             return
-        self._eligibility_correction_bias = (
-            self.e_score_correction_bias.detach().clone()
-        )
+        if self._eligibility_correction_bias is None:
+            self._eligibility_correction_bias = (
+                self.e_score_correction_bias.detach().clone()
+            )
+        else:
+            self._eligibility_correction_bias.copy_(self.e_score_correction_bias)
         self._eligibility_correction_bias.masked_fill_(
             self._expert_ineligibility_mask, float("-inf")
         )

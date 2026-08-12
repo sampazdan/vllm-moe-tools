@@ -306,6 +306,7 @@ class ServingTokens(GenerateBaseServing):
                 token_ids=as_list(output.token_ids),
                 routed_experts=routed_experts_b64,
                 routed_expert_weights=routed_expert_weights_b64,
+                expert_context_fingerprint=output.expert_context_fingerprint,
             )
 
             choices.append(choice_data)
@@ -341,6 +342,7 @@ class ServingTokens(GenerateBaseServing):
             prompt_logprobs=clamp_prompt_logprobs(final_res.prompt_logprobs),
             kv_transfer_params=final_res.kv_transfer_params,
             ec_transfer_params=final_res.ec_transfer_params,
+            expert_context_fingerprint=final_res.expert_context_fingerprint,
         )
 
         # Log complete response if output logging is enabled
@@ -376,6 +378,7 @@ class ServingTokens(GenerateBaseServing):
         num_generated_tokens: list[int] = []
         first_iteration = True
         num_cached_tokens = None
+        last_res = None
         sampling_params: SamplingParams = request.sampling_params
 
         include_usage, include_continuous_usage = should_include_usage(
@@ -384,6 +387,7 @@ class ServingTokens(GenerateBaseServing):
 
         try:
             async for res in result_generator:
+                last_res = res
                 if first_iteration:
                     if res.prompt_token_ids is not None:
                         num_prompt_tokens = len(res.prompt_token_ids)
@@ -440,9 +444,13 @@ class ServingTokens(GenerateBaseServing):
                                 token_ids=as_list(delta_token_ids),
                                 routed_experts=routed_experts_b64,
                                 routed_expert_weights=routed_expert_weights_b64,
+                                expert_context_fingerprint=(
+                                    output.expert_context_fingerprint
+                                ),
                             )
                         ],
                     )
+                    chunk.expert_context_fingerprint = res.expert_context_fingerprint
                     if include_continuous_usage:
                         chunk.usage = UsageInfo(
                             prompt_tokens=num_prompt_tokens,
@@ -469,6 +477,11 @@ class ServingTokens(GenerateBaseServing):
                     request_id=request_id,
                     choices=[],
                     usage=final_usage_info,
+                    expert_context_fingerprint=(
+                        last_res.expert_context_fingerprint
+                        if last_res is not None
+                        else None
+                    ),
                 )
                 yield f"data: {final_chunk.model_dump_json(exclude_none=True)}\n\n"
 

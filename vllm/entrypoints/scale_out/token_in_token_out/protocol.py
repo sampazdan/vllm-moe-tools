@@ -201,6 +201,7 @@ class GenerateResponseChoice(BaseModel):
     # or (b) ``enable_return_routed_experts`` is off server-side.
     routed_experts: str | None = None
     routed_expert_weights: str | None = None
+    expert_context_fingerprint: str | None = None
 
     @field_validator("token_ids")
     @classmethod
@@ -217,6 +218,7 @@ class GenerateResponseStreamChoice(BaseModel):
     token_ids: list[int] | None = None
     routed_experts: str | None = None
     routed_expert_weights: str | None = None
+    expert_context_fingerprint: str | None = None
 
 
 class GenerateStreamResponse(BaseModel):
@@ -230,6 +232,7 @@ class GenerateStreamResponse(BaseModel):
     )
     choices: list[GenerateResponseStreamChoice]
     usage: UsageInfo | None = Field(default=None)
+    expert_context_fingerprint: str | None = None
 
 
 class GenerateResponse(BaseModel):
@@ -246,6 +249,7 @@ class GenerateResponse(BaseModel):
     choices: list[GenerateResponseChoice]
     usage: UsageInfo | None = Field(default=None)
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
+    expert_context_fingerprint: str | None = None
 
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None,

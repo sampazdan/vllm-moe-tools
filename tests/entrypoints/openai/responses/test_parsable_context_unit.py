@@ -162,6 +162,7 @@ def _make_request_output(
     text: str = "Hello, world!",
     token_ids: Sequence[int] = (1, 2, 3),
     finish_reason: str = "stop",
+    expert_context_fingerprint: str | None = None,
 ) -> RequestOutput:
     return RequestOutput(
         request_id="test",
@@ -179,6 +180,7 @@ def _make_request_output(
             )
         ],
         finished=True,
+        expert_context_fingerprint=expert_context_fingerprint,
     )
 
 
@@ -229,6 +231,20 @@ def test_process_text_without_parser():
     msg = ctx.response_messages[0]
     assert msg.type == "message"
     assert msg.content[0].text == "Hello!"
+
+
+def test_responses_context_captures_and_rejects_mixed_expert_provenance():
+    ctx = _make_context(None)
+    first = "a" * 64
+    ctx.append_output(
+        _make_request_output(text="one", expert_context_fingerprint=first)
+    )
+
+    assert ctx.expert_context_fingerprint == first
+    with pytest.raises(RuntimeError, match="crossed expert contexts"):
+        ctx.append_output(
+            _make_request_output(text="two", expert_context_fingerprint="b" * 64)
+        )
 
 
 # ---------------------------------------------------------------------------

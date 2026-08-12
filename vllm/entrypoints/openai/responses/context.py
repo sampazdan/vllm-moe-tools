@@ -104,6 +104,21 @@ class TurnMetrics:
 
 class ConversationContext(ABC):
     response_parser: Parser | None = None
+    expert_context_fingerprint: str | None = None
+
+    def capture_expert_context(self, output: RequestOutput) -> None:
+        observed = output.expert_context_fingerprint
+        if observed is None:
+            return
+        if (
+            self.expert_context_fingerprint is not None
+            and self.expert_context_fingerprint != observed
+        ):
+            raise RuntimeError(
+                "responses generation crossed expert contexts: "
+                f"{self.expert_context_fingerprint} != {observed}"
+            )
+        self.expert_context_fingerprint = observed
 
     @abstractmethod
     def append_output(self, output: RequestOutput) -> None:
@@ -206,6 +221,7 @@ class SimpleContext(ConversationContext):
         self.last_output = output
         if not isinstance(output, RequestOutput):
             raise ValueError("SimpleContext only supports RequestOutput.")
+        self.capture_expert_context(output)
         self.num_prompt_tokens = len(output.prompt_token_ids or [])
         self.num_cached_tokens = output.num_cached_tokens or 0
         self.num_output_tokens += len(output.outputs[0].token_ids or [])
@@ -334,6 +350,7 @@ class ParsableContext(ConversationContext):
         self.ec_transfer_params: dict[str, Any] | None = None
 
     def append_output(self, output: RequestOutput) -> None:
+        self.capture_expert_context(output)
         self.num_prompt_tokens = len(output.prompt_token_ids or [])
         self.num_cached_tokens = output.num_cached_tokens or 0
         self.num_output_tokens += len(output.outputs[0].token_ids or [])
@@ -640,6 +657,7 @@ class HarmonyContext(ConversationContext):
         self.ec_transfer_params: dict[str, Any] | None = None
 
     def append_output(self, output: RequestOutput) -> None:
+        self.capture_expert_context(output)
         if self.first_tok_of_message:
             self.finish_reason = None
             self._update_prefill_token_usage(output)

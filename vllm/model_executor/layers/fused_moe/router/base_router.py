@@ -209,33 +209,67 @@ class BaseRouter(FusedMoERouter):
     def _expert_eligibility_mask_changed(self) -> None:
         pass
 
+    def validate_expert_eligibility_mask(
+        self,
+        mask: torch.Tensor,
+        *,
+        logical_num_experts: int | None = None,
+    ) -> None:
+        """Validate an eligibility mask without changing router state."""
+        if mask.dtype != torch.bool or mask.ndim != 1:
+            raise ValueError("expert eligibility mask must be a 1D bool tensor")
+        expected_num_experts = (
+            self.global_num_experts
+            if logical_num_experts is None
+            else logical_num_experts
+        )
+        if not 0 < expected_num_experts <= self.global_num_experts:
+            raise ValueError("invalid logical expert count for eligibility mask")
+        if mask.numel() != expected_num_experts:
+            raise ValueError(
+                "expert eligibility mask size must equal the logical expert count"
+            )
+        if int(mask.count_nonzero()) < self.top_k:
+            raise ValueError("expert eligibility mask enables fewer than top_k")
+        self._validate_expert_eligibility_mask(mask)
+
     def set_expert_eligibility_mask(
         self,
         mask: torch.Tensor | None,
         *,
         logical_num_experts: int | None = None,
     ) -> None:
-        """Restrict routing to the experts selected by a boolean mask."""
-        if mask is not None:
-            if mask.dtype != torch.bool or mask.ndim != 1:
-                raise ValueError("expert eligibility mask must be a 1D bool tensor")
-            expected_num_experts = (
-                self.global_num_experts
-                if logical_num_experts is None
-                else logical_num_experts
+        """Restrict routing while preserving initialized buffer identities.
+
+        The first non-``None`` mask initializes the storage. Later updates use
+        in-place copies so compiled code and CUDA graphs keep observing the same
+        tensors. Clearing an initialized mask restores the all-eligible baseline
+        without replacing either tensor.
+        """
+        if mask is None:
+            if self.expert_eligibility_mask is None:
+                return
+            self.expert_eligibility_mask.fill_(True)
+            assert self._expert_ineligibility_mask is not None
+            self._expert_ineligibility_mask.fill_(False)
+            self._expert_eligibility_mask_changed()
+            return
+
+        self.validate_expert_eligibility_mask(
+            mask, logical_num_experts=logical_num_experts
+        )
+        if self.expert_eligibility_mask is None:
+            self.expert_eligibility_mask = mask.detach().clone()
+            self._expert_ineligibility_mask = torch.empty_like(
+                self.expert_eligibility_mask
             )
-            if not 0 < expected_num_experts <= self.global_num_experts:
-                raise ValueError("invalid logical expert count for eligibility mask")
-            if mask.numel() != expected_num_experts:
-                raise ValueError(
-                    "expert eligibility mask size must equal the logical expert count"
-                )
-            if int(mask.count_nonzero()) < self.top_k:
-                raise ValueError("expert eligibility mask enables fewer than top_k")
-            self._validate_expert_eligibility_mask(mask)
-        self.expert_eligibility_mask = mask
-        self._expert_ineligibility_mask = (
-            torch.logical_not(mask) if mask is not None else None
+        else:
+            if self.expert_eligibility_mask.shape != mask.shape:
+                raise ValueError("cannot resize an initialized eligibility mask")
+            self.expert_eligibility_mask.copy_(mask)
+        assert self._expert_ineligibility_mask is not None
+        torch.logical_not(
+            self.expert_eligibility_mask, out=self._expert_ineligibility_mask
         )
         self._expert_eligibility_mask_changed()
 

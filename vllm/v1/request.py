@@ -78,6 +78,7 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        expert_context_fingerprint: str | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -220,6 +221,7 @@ class Request:
         # If True, request should be aborted immediately after being added to
         # the scheduler so the connector's request_finished hook runs.
         self.abort_immediately = abort_immediately
+        self.expert_context_fingerprint = expert_context_fingerprint
 
     @classmethod
     def from_engine_core_request(
@@ -247,6 +249,7 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            expert_context_fingerprint=request.expert_context_fingerprint,
         )
 
     def append_output_token_ids(

@@ -48,6 +48,7 @@ def _ref_convert_id_to_token(
     return tokenizer.decode([token_id]) or ""
 
 
+@pytest.mark.skip_global_cleanup
 def test_routed_expert_weights_are_paired_in_final_output():
     output_processor = OutputProcessor(
         None,
@@ -64,6 +65,7 @@ def test_routed_expert_weights_are_paired_in_final_output():
         data_parallel_rank=None,
         sampling_params=SamplingParams(),
         pooling_params=None,
+        expert_context_fingerprint="a" * 64,
     )
     output_processor.add_request(request, None)
     routed_experts = np.arange(20, dtype=np.uint8).reshape(5, 2, 2)
@@ -74,6 +76,7 @@ def test_routed_expert_weights_are_paired_in_final_output():
         finish_reason=FinishReason.LENGTH,
         routed_experts=routed_experts,
         routed_expert_weights=routed_expert_weights,
+        expert_context_fingerprint="a" * 64,
     )
 
     processed = output_processor.process_outputs([output])
@@ -84,6 +87,36 @@ def test_routed_expert_weights_are_paired_in_final_output():
         completion.routed_expert_weights,
         routed_expert_weights,
     )
+    assert completion.expert_context_fingerprint == "a" * 64
+    assert processed.request_outputs[0].expert_context_fingerprint == "a" * 64
+
+
+@pytest.mark.skip_global_cleanup
+def test_output_processor_rejects_context_provenance_mismatch():
+    output_processor = OutputProcessor(None, log_stats=False)
+    request = EngineCoreRequest(
+        request_id="request-int",
+        external_req_id="request",
+        prompt_token_ids=[1],
+        mm_features=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        sampling_params=SamplingParams(),
+        pooling_params=None,
+        expert_context_fingerprint="a" * 64,
+    )
+    output_processor.add_request(request, None)
+    output = EngineCoreOutput(
+        request_id=request.request_id,
+        new_token_ids=[2],
+        finish_reason=FinishReason.LENGTH,
+        expert_context_fingerprint="b" * 64,
+    )
+
+    with pytest.raises(RuntimeError, match="does not match request provenance"):
+        output_processor.process_outputs([output])
 
 
 @pytest.mark.parametrize(

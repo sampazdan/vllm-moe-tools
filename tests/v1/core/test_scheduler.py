@@ -32,6 +32,7 @@ from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import (
     Scheduler,
     _clamp_routed_experts_prompt_start,
+    _resolve_expert_context_fingerprint,
 )
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import FinishReason
@@ -53,6 +54,13 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.skip_global_cleanup
+def test_scheduler_rejects_mixed_expert_context_batch():
+    assert _resolve_expert_context_fingerprint(["a" * 64, "a" * 64]) == "a" * 64
+    with pytest.raises(RuntimeError, match="cannot mix requests"):
+        _resolve_expert_context_fingerprint(["a" * 64, "b" * 64])
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():

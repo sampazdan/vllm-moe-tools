@@ -92,6 +92,20 @@ variables or append ordinary `vllm serve` arguments:
 RUNPOD_VLLM_MAX_NUM_SEQS=32 runpod-serve --disable-log-stats
 ```
 
+Pin production loads to an immutable Hugging Face commit with
+`RUNPOD_VLLM_REVISION`. It must be exactly 40 lowercase hexadecimal characters.
+The accepted Qwen revision is:
+
+```bash
+RUNPOD_VLLM_REVISION=95a723d08a9490559dae23d0cff1d9466213d989 \
+  runpod-serve
+```
+
+The wrapper binds both `--revision` and `--tokenizer-revision` to this value,
+then preflights the pinned config and fast tokenizer into the Hugging Face cache
+before vLLM starts. It records the revision in
+`/workspace/logs/vllm-server-config.txt`.
+
 Set `RUNPOD_CAPTURE_ROUTING=1` when routed-expert IDs and weights are needed.
 Leave it disabled for clean performance measurements.
 

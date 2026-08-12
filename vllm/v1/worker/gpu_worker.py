@@ -53,6 +53,7 @@ from vllm.distributed.weight_transfer import (
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
+from vllm.model_load_progress import model_load_progress, track_model_load_phase
 from vllm.multimodal.gpu_ipc_memory import reserve_mm_ipc_gpu_memory
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
@@ -178,6 +179,8 @@ class Worker(WorkerBase):
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
+        self.expert_context_controller: Any | None = None
+        self.expert_context_enforced = False
 
     def _get_sleep_mode_backend(self) -> "SleepModeBackend":
         if self._sleep_mode_backend is None:
@@ -302,6 +305,10 @@ class Worker(WorkerBase):
             torch._C._accelerator_setAllocatorSettings(f"max_split_size_mb:{restore}")
 
     @instrument(span_name="Init device")
+    @track_model_load_phase(
+        "initializing_distributed_workers",
+        "Initializing the accelerator and distributed worker",
+    )
     def init_device(self):
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
@@ -433,6 +440,10 @@ class Worker(WorkerBase):
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
+    @track_model_load_phase(
+        "loading_weights",
+        "Constructing the model and loading its checkpoint weights",
+    )
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         expert_selection_profile = None
         if profile_path := self.model_config.moe_expert_selection_profile:
@@ -450,14 +461,49 @@ class Worker(WorkerBase):
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
-        if expert_selection_profile is not None:
-            from vllm.model_executor.layers.fused_moe.expert_selection import (
-                bind_expert_selection_profile,
-            )
+        from vllm.model_executor.layers.fused_moe.expert_context import (
+            ExpertContextController,
+        )
 
-            bind_expert_selection_profile(
-                self.model_runner.get_model(), expert_selection_profile
+        model_identity = {
+            "model": self.model_config.model,
+            "revision": self.model_config.revision,
+            "architectures": list(self.model_config.architectures),
+            "quantization": str(self.model_config.quantization),
+            "dtype": str(self.model_config.dtype),
+        }
+        self.expert_context_enforced = (
+            expert_selection_profile is not None
+            or os.environ.get("VLLM_MOE_EXPERT_CONTEXT_CONTROL_TOKEN") is not None
+        )
+        self.expert_context_controller = ExpertContextController(
+            self.model_runner.get_model(),
+            model_identity=model_identity,
+            initialize=self.expert_context_enforced,
+        )
+        if expert_selection_profile is not None:
+            startup_context = self.expert_context_controller.register_profile(
+                "startup-profile",
+                expert_selection_profile.layers,
+                creation_source="startup-profile-file",
+                metadata={"startup_profile": True},
             )
+            if self.expert_context_controller.supported:
+                self.expert_context_controller.prepare_context(
+                    startup_context.context_id
+                )
+                self.expert_context_controller.commit_context()
+            else:
+                from vllm.model_executor.layers.fused_moe.expert_selection import (
+                    bind_expert_selection_profile,
+                )
+
+                bind_expert_selection_profile(
+                    self.model_runner.get_model(), expert_selection_profile
+                )
+                self.expert_context_controller.adopt_startup_context(
+                    startup_context.context_id
+                )
 
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
@@ -465,6 +511,122 @@ class Worker(WorkerBase):
                 self.vllm_config,
                 self.device,
                 self.model_runner.get_model(),
+            )
+
+    def _expert_context_error(self, error: Exception) -> dict[str, object]:
+        return {
+            "ok": False,
+            "rank": self.rank,
+            "error": str(error),
+            "error_type": type(error).__name__,
+        }
+
+    def register_expert_context(
+        self,
+        context_id: str,
+        layers: dict[str, object],
+        creation_source: str = "api",
+        metadata: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Register a bounded context payload without changing routing."""
+        try:
+            if self.expert_context_controller is None:
+                raise RuntimeError("expert context controller is not initialized")
+            context = self.expert_context_controller.register_payload(
+                {
+                    "context_id": context_id,
+                    "layers": layers,
+                    "creation_source": creation_source,
+                    "metadata": metadata or {},
+                }
+            )
+            return {"ok": True, "rank": self.rank, **context.to_dict()}
+        except Exception as error:
+            return self._expert_context_error(error)
+
+    def prepare_expert_context(self, context_id: str) -> dict[str, object]:
+        """Validate and materialize a resident context without mutating routers."""
+        try:
+            if self.expert_context_controller is None:
+                raise RuntimeError("expert context controller is not initialized")
+            context = self.expert_context_controller.prepare_context(context_id)
+            return {"ok": True, "rank": self.rank, **context.to_dict()}
+        except Exception as error:
+            return self._expert_context_error(error)
+
+    def commit_expert_context(self) -> dict[str, object]:
+        """Commit the prepared context and synchronize this worker."""
+        try:
+            if self.expert_context_controller is None:
+                raise RuntimeError("expert context controller is not initialized")
+            context = self.expert_context_controller.commit_context()
+            return {
+                "ok": True,
+                "rank": self.rank,
+                **context.to_dict(),
+                **self.expert_context_controller.current(),
+            }
+        except Exception as error:
+            return self._expert_context_error(error)
+
+    def rollback_expert_context(self) -> dict[str, object]:
+        """Restore the context active before the latest prepare operation."""
+        try:
+            if self.expert_context_controller is None:
+                raise RuntimeError("expert context controller is not initialized")
+            context = self.expert_context_controller.rollback_context()
+            return {
+                "ok": True,
+                "rank": self.rank,
+                **context.to_dict(),
+                **self.expert_context_controller.current(),
+            }
+        except Exception as error:
+            return self._expert_context_error(error)
+
+    def get_expert_context(self) -> dict[str, object]:
+        """Return this worker's committed expert context."""
+        try:
+            if self.expert_context_controller is None:
+                raise RuntimeError("expert context controller is not initialized")
+            return {
+                "ok": True,
+                "rank": self.rank,
+                **self.expert_context_controller.current(),
+            }
+        except Exception as error:
+            return self._expert_context_error(error)
+
+    def get_expert_context_capabilities(self) -> dict[str, object]:
+        """Return actual loaded routing topology and hot-switch capability."""
+        try:
+            if self.expert_context_controller is None:
+                raise RuntimeError("expert context controller is not initialized")
+            return {
+                "ok": True,
+                "rank": self.rank,
+                **self.expert_context_controller.capabilities(),
+            }
+        except Exception as error:
+            return self._expert_context_error(error)
+
+    def _validate_expert_context_batch(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        if not getattr(self, "expert_context_enforced", False):
+            return
+        if scheduler_output.total_num_scheduled_tokens == 0:
+            return
+        if self.expert_context_controller is None:
+            raise RuntimeError("expert context controller is not initialized")
+        expected = scheduler_output.expert_context_fingerprint
+        if expected is None:
+            raise RuntimeError("scheduled request lacks expert context provenance")
+        actual = self.expert_context_controller.active_context.fingerprint
+        if expected != actual:
+            raise RuntimeError(
+                "scheduled request expert context does not match the worker's "
+                "active routing context"
             )
 
     def update_config(self, overrides: dict[str, Any]) -> None:
@@ -492,7 +654,7 @@ class Worker(WorkerBase):
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
-            self.model_runner.profile_run()
+            self._profile_run_with_compile_progress()
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -519,7 +681,7 @@ class Worker(WorkerBase):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
-            self.model_runner.profile_run()
+            self._profile_run_with_compile_progress()
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
@@ -628,6 +790,19 @@ class Worker(WorkerBase):
             getattr(self.parallel_config, "_api_process_count", 1),
         )
 
+    def _profile_run_with_compile_progress(self) -> None:
+        progress = (
+            model_load_progress(
+                "compiling",
+                "Preparing compiled model artifacts during initial execution profiling",
+                owner=self,
+            )
+            if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
+            else nullcontext()
+        )
+        with progress:
+            self.model_runner.profile_run()
+
     def get_kv_connector_handshake_metadata(
         self,
     ) -> dict[tuple[int, int], KVConnectorHandshakeMetadata] | None:
@@ -720,15 +895,17 @@ class Worker(WorkerBase):
                 if not any(x in compile_range for x in all_sizes):
                     warmup_sizes.append(compile_range.end)
 
-        # We skip EPLB here since we don't want to record dummy metrics
-        for size in sorted(warmup_sizes, reverse=True):
-            logger.info("Compile and warming up model for size %d", size)
-            self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
+        self._run_startup_compile_warmups(warmup_sizes)
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
-        kernel_warmup(self)
+        with model_load_progress(
+            "warming",
+            "Executing registered model-kernel warmup hooks",
+            owner=self,
+        ):
+            kernel_warmup(self)
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
@@ -873,6 +1050,17 @@ class Worker(WorkerBase):
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
         )
+
+    def _run_startup_compile_warmups(self, warmup_sizes: list[int]) -> None:
+        ordered_sizes = sorted(warmup_sizes, reverse=True)
+        # We skip EPLB here since we don't want to record dummy metrics.
+        for size in ordered_sizes:
+            logger.info("Compile and warming up model for size %d", size)
+            self.model_runner._dummy_run(
+                size,
+                skip_eplb=True,
+                remove_lora=False,
+            )
 
     def reset_mm_cache(self) -> None:
         self.model_runner.reset_mm_cache()
@@ -1041,6 +1229,7 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        self._validate_expert_context_batch(scheduler_output)
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
             for handle in self._pp_send_work:

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import base64
+import io
 import json
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -8,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import numpy as np
 import pytest
 import pytest_asyncio
 from openai import OpenAI
@@ -639,6 +642,8 @@ def _build_minimal_metrics_serving_chat(
 def _make_metrics_request_output(
     metrics: RequestStateStats | None = _PER_REQUEST_STATS,
     token_ids: tuple[int, ...] = (100, 101),
+    routed_experts: np.ndarray | None = None,
+    routed_expert_weights: np.ndarray | None = None,
 ) -> RequestOutput:
     return RequestOutput(
         request_id="test-id",
@@ -653,9 +658,13 @@ def _make_metrics_request_output(
                 cumulative_logprob=None,
                 logprobs=None,
                 finish_reason="stop",
+                routed_experts=routed_experts,
+                routed_expert_weights=routed_expert_weights,
+                expert_context_fingerprint="a" * 64,
             )
         ],
         finished=True,
+        expert_context_fingerprint="a" * 64,
         metrics=metrics,
     )
 
@@ -779,6 +788,52 @@ async def test_chat_streaming_metrics_ride_on_usage_chunk():
     usage_chunks = [chunk for chunk in chunks if chunk.get("usage")]
     assert usage_chunks
     assert usage_chunks[-1]["metrics"]["time_to_first_token_ms"] == pytest.approx(500.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skip_global_cleanup
+async def test_chat_streaming_routing_telemetry_rides_on_final_usage_chunk():
+    routed_experts = np.arange(12, dtype=np.uint8).reshape(3, 2, 2)
+    routed_expert_weights = np.linspace(0.1, 0.9, 12, dtype=np.float32).reshape(3, 2, 2)
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=True)
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "Test prompt"}],
+        max_tokens=10,
+        stream=True,
+        return_token_ids=True,
+        stream_options={"include_usage": True},
+    )
+    output = _make_metrics_request_output(
+        routed_experts=routed_experts,
+        routed_expert_weights=routed_expert_weights,
+    )
+    chunks: list[dict[str, Any]] = []
+    async for line in serving.chat_completion_stream_generator(
+        request,
+        _single_request_output(output),
+        "chatcmpl-test-id",
+        "test-model",
+        conversation=[{"role": "user", "content": "Test"}],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+    ):
+        line = line.strip()
+        if line.startswith("data: ") and line != "data: [DONE]":
+            chunks.append(json.loads(line[len("data: ") :]))
+
+    final = chunks[-1]
+    assert final["choices"] == []
+    assert final["expert_context_fingerprint"] == "a" * 64
+    assert final["metrics"]["tokens_per_second"] == pytest.approx(2 / 1.5)
+    np.testing.assert_array_equal(
+        np.load(io.BytesIO(base64.b64decode(final["routed_experts"]))),
+        routed_experts,
+    )
+    np.testing.assert_array_equal(
+        np.load(io.BytesIO(base64.b64decode(final["routed_expert_weights"]))),
+        routed_expert_weights,
+    )
 
 
 @dataclass

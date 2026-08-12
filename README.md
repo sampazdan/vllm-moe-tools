@@ -77,6 +77,59 @@ Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
 - [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
 - [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
 
+## MoE expert contexts (fork extension)
+
+This fork can switch between baseline and expert-eligibility contexts without
+reloading model weights. Set a separate random control token of at least 32
+characters before starting the OpenAI server:
+
+```bash
+export VLLM_MOE_EXPERT_CONTEXT_CONTROL_TOKEN='<random internal token>'
+```
+
+The control router is absent when the variable is unset. When enabled, it only
+accepts loopback clients and requires the token in the
+`X-vLLM-Expert-Context-Token` header. Do not expose this token or these routes
+through a public reverse proxy. If the server also uses `--api-key`, its normal
+`Authorization: Bearer ...` header is required in addition to the context token.
+
+The exact control surface is rooted at `/v1/internal/moe-contexts`:
+
+- `GET /capabilities` returns the loaded per-layer routing topology, support
+  reasons, topology fingerprint, and active context.
+- `GET /current` returns the committed context and stable process identities.
+- `POST /register` accepts an immutable `context_id`, optional metadata, and
+  `layers: {"<layer>": {"keep": [...]}}`. Omitted model layers are canonicalized
+  as all eligible.
+- `POST /activate` accepts `{"context_id": "..."}`.
+- `POST /reset` activates the built-in all-experts `baseline` context.
+
+Activation atomically closes frontend admission, drains admitted HTTP responses
+through their final streaming chunk, aborts any remaining engine stragglers,
+and clears KV, prefix, connector, multimodal, encoder, and routed-telemetry
+caches. It then prepares every tensor-parallel worker, applies stable router
+buffers in place, and synchronizes before commit. Any worker error restores the
+previously committed context. Ambiguous current, rollback, or scheduler-resume
+state leaves admission closed until an explicit recovery verifies unanimous
+worker state and resumes generation. Receipts include old/new context
+fingerprints, topology fingerprint, duration, process identities, and
+`weights_reloaded=false`.
+
+Fingerprints are canonical SHA-256 values encoded as 64 lowercase hexadecimal
+characters. The active `expert_context_fingerprint` is captured when each
+request is admitted and propagated through scheduler, worker, request,
+chat-completion, and text-completion outputs, including streams. Each worker
+checks the unanimous scheduled fingerprint against its actual active router
+context before GPU execution, and the frontend rejects inconsistent outputs,
+so a request cannot silently straddle a switch.
+
+Hot activation currently requires data parallel size 1, pipeline parallel size
+1, and one API-server process. Tensor parallelism is supported and requires
+unanimous worker fingerprints. Unsupported monolithic, hash, custom, simulator,
+or unsafe grouped routing paths are reported by `/capabilities` and fail closed.
+The existing `--moe-expert-selection-profile` flag remains supported as a
+cold-start context.
+
 ## Contributing
 
 We welcome and value any contributions and collaborations.

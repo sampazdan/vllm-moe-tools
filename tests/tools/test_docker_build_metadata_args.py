@@ -152,6 +152,62 @@ def test_vllm_openai_image_embeds_metadata_contract() -> None:
         assert expected in dockerfile
 
 
+def test_runpod_launcher_pins_model_and_tokenizer_to_same_revision() -> None:
+    launcher = (REPO_ROOT / "docker" / "runpod" / "runpod-serve.sh").read_text()
+
+    assert '--revision "${revision}"' in launcher
+    assert '--tokenizer-revision "${revision}"' in launcher
+
+
+def test_runpod_launcher_fails_before_vllm_when_tokenizer_preflight_fails(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    timeout = fake_bin / "timeout"
+    timeout.write_text(
+        '#!/bin/sh\nprintf \'%s\\n\' "$1" "$2" "$3" '
+        '>"$RUNPOD_TEST_TIMEOUT_ARGS"\nshift 3\nexec "$@"\n'
+    )
+    timeout.chmod(0o755)
+    preflight = tmp_path / "preflight-python"
+    preflight.write_text(
+        '#!/bin/sh\nprintf \'%s\\n\' "$@" >"$RUNPOD_TEST_PREFLIGHT_ARGS"\nexit 29\n'
+    )
+    preflight.chmod(0o755)
+    preflight_args = tmp_path / "preflight-args"
+    timeout_args = tmp_path / "timeout-args"
+    revision = "1" * 40
+
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "docker" / "runpod" / "runpod-serve.sh")],
+        env={
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "RUNPOD_TEST_PREFLIGHT_ARGS": str(preflight_args),
+            "RUNPOD_TEST_TIMEOUT_ARGS": str(timeout_args),
+            "RUNPOD_VLLM_MODEL": "example/model",
+            "RUNPOD_VLLM_PREFLIGHT_PYTHON": str(preflight),
+            "RUNPOD_VLLM_REVISION": revision,
+        },
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert result.returncode == 29
+    assert preflight_args.read_text().splitlines() == [
+        "-",
+        "example/model",
+        revision,
+    ]
+    assert timeout_args.read_text().splitlines() == [
+        "--signal=TERM",
+        "--kill-after=10s",
+        "300s",
+    ]
+    assert "Starting managed vLLM" not in result.stdout
+
+
 def test_rocm_ci_base_bake_embeds_content_hash_label() -> None:
     bake_file = (REPO_ROOT / "docker" / "docker-bake-rocm.hcl").read_text()
 

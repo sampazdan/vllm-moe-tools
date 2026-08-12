@@ -423,6 +423,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                                 ),
                             )
                         ],
+                        expert_context_fingerprint=res.expert_context_fingerprint,
                     )
                     # Stamp on terminal chunk only when no trailing usage chunk
                     # will follow (that one is the true final message).
@@ -483,6 +484,11 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     usage=final_usage_info,
                     system_fingerprint=self.system_fingerprint,
                     metrics=stream_per_request_metrics,
+                    expert_context_fingerprint=(
+                        last_res.expert_context_fingerprint
+                        if last_res is not None
+                        else None
+                    ),
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(
                     exclude_unset=False, exclude_none=True
@@ -604,6 +610,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     ),
                     routed_experts=routed_experts_b64,
                     routed_expert_weights=routed_expert_weights_b64,
+                    expert_context_fingerprint=(output.expert_context_fingerprint),
                 )
                 choices.append(choice_data)
 
@@ -658,6 +665,11 @@ class OpenAIServingCompletion(GenerateBaseServing):
             kv_transfer_params=kv_transfer_params,
             ec_transfer_params=ec_transfer_params,
             metrics=per_request_metrics,
+            expert_context_fingerprint=(
+                last_final_res.expert_context_fingerprint
+                if last_final_res is not None
+                else None
+            ),
         )
 
     def _create_completion_logprobs(
