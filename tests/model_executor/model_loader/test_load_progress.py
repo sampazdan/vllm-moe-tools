@@ -239,12 +239,12 @@ def test_startup_compile_phase_completes_after_all_configured_shapes(
         (
             "compiling",
             "started",
-            "Restoring and validating cached AOT startup model artifacts",
+            "Preparing and validating configured AOT startup model artifacts",
         ),
         (
             "compiling",
             "completed",
-            "Restoring and validating cached AOT startup model artifacts",
+            "Preparing and validating configured AOT startup model artifacts",
         ),
     ]
 

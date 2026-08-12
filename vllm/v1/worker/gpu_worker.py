@@ -1045,7 +1045,7 @@ class Worker(WorkerBase):
             and self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
         )
         progress_detail = (
-            "Restoring and validating cached AOT startup model artifacts"
+            "Preparing and validating configured AOT startup model artifacts"
             if envs.VLLM_USE_AOT_COMPILE
             else "Compiling configured startup model shapes"
         )
