@@ -199,7 +199,7 @@ def test_routed_experts_manager_uses_kimi_k3_experts_per_token():
     assert manager.routed_experts_by_slot.shape == (8, 3, 2)
 
 
-def test_routed_experts_manager_stores_paired_weights_by_slot():
+def test_routed_experts_manager_invalidates_paired_weights_by_epoch():
     hf_config = SimpleNamespace(
         num_experts=8,
         num_experts_per_token=2,
@@ -222,10 +222,18 @@ def test_routed_experts_manager_stores_paired_weights_by_slot():
     manager = RoutedExpertsManager(vllm_config, kv_cache_config)
     ids = np.arange(12, dtype=np.int32).reshape(2, 3, 2)
     weights = np.linspace(0.1, 0.9, 12, dtype=np.float32).reshape(2, 3, 2)
+    slot_mapping = np.array([1, 5])
 
-    manager.store_batch(ids, np.array([1, 5]), weights)
-
+    manager.routed_experts_by_slot[slot_mapping] = 99
     assert manager.routed_expert_weights_by_slot is not None
+    manager.routed_expert_weights_by_slot[slot_mapping] = 0.99
+    with pytest.raises(RuntimeError, match="telemetry is unavailable"):
+        manager.get([0], 2, token_start=1)
+    with pytest.raises(RuntimeError, match="telemetry is unavailable"):
+        manager.get_weights([0], 2, token_start=1)
+
+    manager.store_batch(ids, slot_mapping, weights)
+
     np.testing.assert_array_equal(manager.routed_experts_by_slot[[1, 5]], ids)
     np.testing.assert_array_equal(
         manager.routed_expert_weights_by_slot[[1, 5]], weights
@@ -237,9 +245,27 @@ def test_routed_experts_manager_stores_paired_weights_by_slot():
 
     manager.reset()
 
-    assert not manager.routed_experts_by_slot.any()
-    assert manager.routed_expert_weights_by_slot is not None
-    assert not manager.routed_expert_weights_by_slot.any()
+    np.testing.assert_array_equal(manager.routed_experts_by_slot[[1, 5]], ids)
+    np.testing.assert_array_equal(
+        manager.routed_expert_weights_by_slot[[1, 5]], weights
+    )
+    with pytest.raises(RuntimeError, match="telemetry is unavailable"):
+        manager.get([0], 2, token_start=1)
+    with pytest.raises(RuntimeError, match="telemetry is unavailable"):
+        manager.get_weights([0], 2, token_start=1)
+
+    replacement_ids = ids[:1] + 20
+    replacement_weights = weights[:1] + 1
+    manager.store_batch(replacement_ids, np.array([1]), replacement_weights)
+
+    np.testing.assert_array_equal(manager.get([0], 2, token_start=1), replacement_ids)
+    np.testing.assert_array_equal(
+        manager.get_weights([0], 2, token_start=1), replacement_weights
+    )
+    with pytest.raises(RuntimeError, match="telemetry is unavailable"):
+        manager.get([0], 2)
+    with pytest.raises(RuntimeError, match="telemetry is unavailable"):
+        manager.get_weights([1], 2, token_start=1)
 
 
 def test_base_router_capture_pre_eplb_mapping():

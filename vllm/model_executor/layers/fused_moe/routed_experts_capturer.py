@@ -358,8 +358,8 @@ class RoutedExpertsManager:
 
     Memory: the slot buffers cover the whole block pool
     (``num_blocks * block_size`` slots). The optional float32 weight
-    buffer adds four bytes per captured expert; see the init logs for
-    exact sizes.
+    buffer adds four bytes per captured expert. A uint64 epoch per slot
+    supports constant-time invalidation; see the init logs for payload sizes.
     """
 
     def __init__(
@@ -385,7 +385,7 @@ class RoutedExpertsManager:
         # this narrow matters because the slot buffer is sized for the
         # whole block pool and can reach multiple GB.
         expert_id_dtype = np.uint8 if num_experts <= 256 else np.uint16
-        self.routed_experts_by_slot = np.zeros(
+        self.routed_experts_by_slot = np.empty(
             (
                 max_num_slots,
                 num_layers,
@@ -394,7 +394,7 @@ class RoutedExpertsManager:
             dtype=expert_id_dtype,
         )
         self.routed_expert_weights_by_slot = (
-            np.zeros_like(self.routed_experts_by_slot, dtype=np.float32)
+            np.empty_like(self.routed_experts_by_slot, dtype=np.float32)
             if getattr(
                 vllm_config.model_config,
                 "enable_return_routed_expert_weights",
@@ -402,6 +402,8 @@ class RoutedExpertsManager:
             )
             else None
         )
+        self._slot_epochs = np.zeros(max_num_slots, dtype=np.uint64)
+        self._current_epoch = 1
         logger.info(
             "RoutedExpertsManager CPU buffer: %.2f GB "
             "(slots=%d, layers=%d, top_k=%d, dtype=%s)",
@@ -419,9 +421,11 @@ class RoutedExpertsManager:
 
     def reset(self) -> None:
         """Invalidate routing data stored in physical KV-cache slots."""
-        self.routed_experts_by_slot.fill(0)
-        if self.routed_expert_weights_by_slot is not None:
-            self.routed_expert_weights_by_slot.fill(0)
+        if self._current_epoch == np.iinfo(self._slot_epochs.dtype).max:
+            self._slot_epochs.fill(0)
+            self._current_epoch = 1
+        else:
+            self._current_epoch += 1
 
     def store_batch(
         self,
@@ -445,10 +449,12 @@ class RoutedExpertsManager:
                 )
         elif weights is not None:
             raise ValueError("Routed expert weights were provided but not enabled.")
+        self._slot_epochs[slot_mapping] = 0
         self.routed_experts_by_slot[slot_mapping] = data
         if self.routed_expert_weights_by_slot is not None:
             assert weights is not None
             self.routed_expert_weights_by_slot[slot_mapping] = weights
+        self._slot_epochs[slot_mapping] = self._current_epoch
 
     def get(
         self,
@@ -459,18 +465,20 @@ class RoutedExpertsManager:
         """Read routed experts data for a completed / preempted request.
 
         Reconstructs a per-token slot_mapping from the request's block
-        IDs and returns the routing slice. Because numpy fancy indexing
-        returns a **copy** (not a view), the returned ndarray is safe
-        to hold across subsequent :meth:`store_batch` calls — do not
-        replace the fancy index with a slice without re-verifying.
+        IDs and returns the routing slice. Unwritten slots and data from before
+        the most recent :meth:`reset` are rejected. Because numpy fancy
+        indexing returns a **copy** (not a view), the returned ndarray is safe
+        to hold across subsequent :meth:`store_batch` calls — do not replace
+        the fancy index with a slice without re-verifying.
 
         Args:
             block_ids: Block IDs from the attention KV-cache group.
             num_tokens: Number of tokens that have gone through a forward
                 pass and therefore have routing data written to their
                 slots (typically ``request.num_tokens - 1``; the last
-                sampled token has not been forwarded yet). Slots beyond
-                ``request.num_computed_tokens`` are zero-initialized.
+                sampled token has not been forwarded yet). Invalid slots fail
+                closed without requiring the full backing buffer to be
+                initialized.
             token_start: Skip the first ``token_start`` tokens from the
                 result. The slot_mapping is sliced before the fancy-index
                 read, so only the requested slots are fetched — no large
@@ -480,9 +488,12 @@ class RoutedExpertsManager:
         Returns:
             Array of shape (max(num_tokens - token_start, 0), num_layers,
             num_experts_per_tok).
+
+        Raises:
+            RuntimeError: If any requested slot lacks current routing telemetry.
         """
         slot_mapping = self._get_slot_mapping(block_ids, num_tokens, token_start)
-        return self.routed_experts_by_slot[slot_mapping]
+        return self._read_slots(self.routed_experts_by_slot, slot_mapping)
 
     def get_weights(
         self,
@@ -490,11 +501,28 @@ class RoutedExpertsManager:
         num_tokens: int,
         token_start: int = 0,
     ) -> np.ndarray | None:
-        """Read routed expert weights paired with :meth:`get` results."""
+        """Read routed expert weights paired with :meth:`get` results.
+
+        Raises:
+            RuntimeError: If any requested slot lacks current routing telemetry.
+        """
         if self.routed_expert_weights_by_slot is None:
             return None
         slot_mapping = self._get_slot_mapping(block_ids, num_tokens, token_start)
-        return self.routed_expert_weights_by_slot[slot_mapping]
+        return self._read_slots(self.routed_expert_weights_by_slot, slot_mapping)
+
+    def _read_slots(
+        self,
+        buffer: np.ndarray,
+        slot_mapping: np.ndarray,
+    ) -> np.ndarray:
+        current = self._slot_epochs[slot_mapping] == self._current_epoch
+        if not current.all():
+            raise RuntimeError(
+                "Routed-experts telemetry is unavailable for one or more "
+                "requested KV-cache slots."
+            )
+        return buffer[slot_mapping]
 
     def _get_slot_mapping(
         self,
