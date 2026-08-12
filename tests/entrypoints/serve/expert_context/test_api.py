@@ -119,6 +119,7 @@ class FakeEngineClient:
         if method == "commit_expert_context":
             if self.fail_commit:
                 return [{"ok": False, "rank": 0, "error": "injected failure"}]
+            assert self.pending is not None
             self.active = self.pending
             self.pending = None
             return [self._current()]
@@ -193,6 +194,31 @@ def test_control_api_requires_loopback_and_dedicated_token(monkeypatch):
         ).json()
         assert capabilities["process_id"] == os.getpid()
         assert capabilities["worker_process_ids"] == [42]
+
+
+@pytest.mark.parametrize(
+    ("api_server_count", "expected_supported"),
+    [(None, True), (1, True), (2, False)],
+)
+def test_capabilities_handles_api_server_count_sentinels(
+    monkeypatch, api_server_count, expected_supported
+):
+    engine = FakeEngineClient()
+    app = _app(monkeypatch, engine)
+    app.state.args = SimpleNamespace(api_server_count=api_server_count)
+
+    with TestClient(app, client=("127.0.0.1", 1234)) as client:
+        response = client.get(
+            "/v1/internal/moe-contexts/capabilities",
+            headers=_HEADERS,
+        )
+
+    assert response.status_code == 200
+    assert response.json()["supported"] is expected_supported
+    capability_calls = [
+        call for call in engine.calls if call[0] == "get_expert_context_capabilities"
+    ]
+    assert bool(capability_calls) is expected_supported
 
 
 def test_current_rejects_worker_profile_fingerprint_disagreement(monkeypatch):
@@ -327,7 +353,7 @@ def test_async_pause_cache_reset_failure_resolves_future_with_error():
         raise RuntimeError("connector cache reset failed")
 
     engine = SimpleNamespace(_reset_caches=fail_reset)
-    future = Future()
+    future: Future[None] = Future()
 
     _finish_pause_after_idle(engine, future, clear_cache=True)
 

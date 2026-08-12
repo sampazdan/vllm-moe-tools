@@ -157,7 +157,8 @@ def _single_dp_unsupported_reason(request: Request) -> str | None:
             "unavailable"
         )
     args = getattr(request.app.state, "args", None)
-    if getattr(args, "api_server_count", 1) > 1:
+    api_server_count = getattr(args, "api_server_count", None)
+    if api_server_count is not None and api_server_count > 1:
         return (
             "transactional expert contexts currently require one API server "
             "process so request admission has a single committed context"

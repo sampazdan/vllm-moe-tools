@@ -177,13 +177,16 @@ def test_startup_compile_phase_completes_after_all_configured_shapes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sequence: list[tuple[str, int | str]] = []
+    progress_events: list[tuple[str, str, str]] = []
 
     @contextmanager
-    def record(phase: str, _detail: str, *, owner: object):
+    def record(phase: str, detail: str, *, owner: object):
         assert owner is worker
         sequence.append((phase, "started"))
+        progress_events.append((phase, "started", detail))
         yield
         sequence.append((phase, "completed"))
+        progress_events.append((phase, "completed", detail))
 
     class Runner:
         lora_config = None
@@ -217,16 +220,45 @@ def test_startup_compile_phase_completes_after_all_configured_shapes(
         ("shape", 4),
         ("compiling", "completed"),
     ]
+    assert progress_events == [
+        ("compiling", "started", "Compiling configured startup model shapes"),
+        ("compiling", "completed", "Compiling configured startup model shapes"),
+    ]
 
     sequence.clear()
+    progress_events.clear()
     monkeypatch.setenv("VLLM_USE_AOT_COMPILE", "1")
     gpu_worker.Worker._run_startup_compile_warmups(worker, [4, 8])
-    assert sequence == [("shape", 8), ("shape", 4)]
+    assert sequence == [
+        ("compiling", "started"),
+        ("shape", 8),
+        ("shape", 4),
+        ("compiling", "completed"),
+    ]
+    assert progress_events == [
+        (
+            "compiling",
+            "started",
+            "Restoring and validating cached AOT startup model artifacts",
+        ),
+        (
+            "compiling",
+            "completed",
+            "Restoring and validating cached AOT startup model artifacts",
+        ),
+    ]
 
     sequence.clear()
+    progress_events.clear()
     monkeypatch.setenv("VLLM_USE_AOT_COMPILE", "0")
     gpu_worker.Worker._run_startup_compile_warmups(worker, [])
     assert sequence == []
+    assert progress_events == []
+
+    worker.vllm_config.compilation_config.mode = CompilationMode.NONE
+    gpu_worker.Worker._run_startup_compile_warmups(worker, [4, 8])
+    assert sequence == [("shape", 8), ("shape", 4)]
+    assert progress_events == []
 
 
 def test_hugging_face_snapshot_reports_resolved_file_and_byte_counts(
@@ -286,11 +318,16 @@ def test_hugging_face_snapshot_progress_is_rank_zero_only(
 ) -> None:
     events: list[tuple[str, str]] = []
     downloads: list[str] = []
+
+    def fake_download(model_name: str, *args: object) -> tuple[str, list[str]]:
+        downloads.append(model_name)
+        return str(tmp_path), ["*.bin"]
+
     monkeypatch.setattr(weight_utils, "current_worker_coordinates", lambda: (1, 2))
     monkeypatch.setattr(
         weight_utils,
         "_download_weights_from_hf",
-        lambda *args: (downloads.append(str(args[0])) or str(tmp_path), ["*.bin"]),
+        fake_download,
     )
     monkeypatch.setattr(
         weight_utils,

@@ -1043,12 +1043,16 @@ class Worker(WorkerBase):
         report_progress = (
             bool(ordered_sizes)
             and self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
-            and not envs.VLLM_USE_AOT_COMPILE
+        )
+        progress_detail = (
+            "Restoring and validating cached AOT startup model artifacts"
+            if envs.VLLM_USE_AOT_COMPILE
+            else "Compiling configured startup model shapes"
         )
         progress = (
             model_load_progress(
                 "compiling",
-                "Compiling configured startup model shapes",
+                progress_detail,
                 owner=self,
             )
             if report_progress
