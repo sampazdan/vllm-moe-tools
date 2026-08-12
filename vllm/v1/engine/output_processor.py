@@ -149,6 +149,7 @@ class RequestState:
         n: int | None = None,
         temperature: float | None = None,
         stream_input: bool = False,
+        expert_context_fingerprint: str | None = None,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
@@ -169,6 +170,7 @@ class RequestState:
         self.top_p = top_p
         self.n = n
         self.temperature = temperature
+        self.expert_context_fingerprint = expert_context_fingerprint
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
@@ -272,6 +274,7 @@ class RequestState:
             log_stats=log_stats,
             stream_interval=stream_interval,
             stream_input=request.resumable,
+            expert_context_fingerprint=request.expert_context_fingerprint,
         )
 
     def make_request_output(
@@ -383,6 +386,7 @@ class RequestState:
             ec_transfer_params=ec_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
             num_cache_creation_tokens=self.num_cache_creation_tokens,
+            expert_context_fingerprint=self.expert_context_fingerprint,
             metrics=self.stats,
         )
 
@@ -423,6 +427,7 @@ class RequestState:
             token_ids=token_ids,
             routed_experts=routed_experts,
             routed_expert_weights=routed_expert_weights,
+            expert_context_fingerprint=self.expert_context_fingerprint,
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
@@ -564,6 +569,8 @@ class OutputProcessor:
         self, req_state: RequestState, request: EngineCoreRequest, prompt: str | None
     ) -> None:
         """Queue a streaming update instead of immediately applying it."""
+        if request.expert_context_fingerprint != req_state.expert_context_fingerprint:
+            raise ValueError("streaming request cannot cross expert context boundaries")
         if not request.resumable:
             # Final request - just mark completion, don't add its dummy tokens.
             if req_state.input_chunk_queue is None:
@@ -629,6 +636,16 @@ class OutputProcessor:
             if req_state is None:
                 # Ignore output for already-aborted request.
                 continue
+
+            output_context = engine_core_output.expert_context_fingerprint
+            if output_context is None:
+                engine_core_output.expert_context_fingerprint = (
+                    req_state.expert_context_fingerprint
+                )
+            elif output_context != req_state.expert_context_fingerprint:
+                raise RuntimeError(
+                    "engine output expert context does not match request provenance"
+                )
 
             # 1) Compute stats for this iteration.
             self._update_stats_from_output(

@@ -146,6 +146,7 @@ class EngineCoreRequest(
     abort_immediately: bool = False
 
     session_id: str | None = None
+    expert_context_fingerprint: str | None = None
 
     @property
     def params(self) -> SamplingParams | PoolingParams:
@@ -209,6 +210,7 @@ class EngineCoreOutput(
 
     routed_experts: np.ndarray | None = None
     routed_expert_weights: np.ndarray | None = None
+    expert_context_fingerprint: str | None = None
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0

@@ -178,6 +178,8 @@ class Worker(WorkerBase):
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
+        self.expert_context_controller: Any | None = None
+        self.expert_context_enforced = False
 
     def _get_sleep_mode_backend(self) -> "SleepModeBackend":
         if self._sleep_mode_backend is None:
@@ -450,14 +452,49 @@ class Worker(WorkerBase):
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
-        if expert_selection_profile is not None:
-            from vllm.model_executor.layers.fused_moe.expert_selection import (
-                bind_expert_selection_profile,
-            )
+        from vllm.model_executor.layers.fused_moe.expert_context import (
+            ExpertContextController,
+        )
 
-            bind_expert_selection_profile(
-                self.model_runner.get_model(), expert_selection_profile
+        model_identity = {
+            "model": self.model_config.model,
+            "revision": self.model_config.revision,
+            "architectures": list(self.model_config.architectures),
+            "quantization": str(self.model_config.quantization),
+            "dtype": str(self.model_config.dtype),
+        }
+        self.expert_context_enforced = (
+            expert_selection_profile is not None
+            or os.environ.get("VLLM_MOE_EXPERT_CONTEXT_CONTROL_TOKEN") is not None
+        )
+        self.expert_context_controller = ExpertContextController(
+            self.model_runner.get_model(),
+            model_identity=model_identity,
+            initialize=self.expert_context_enforced,
+        )
+        if expert_selection_profile is not None:
+            startup_context = self.expert_context_controller.register_profile(
+                "startup-profile",
+                expert_selection_profile.layers,
+                creation_source="startup-profile-file",
+                metadata={"startup_profile": True},
             )
+            if self.expert_context_controller.supported:
+                self.expert_context_controller.prepare_context(
+                    startup_context.context_id
+                )
+                self.expert_context_controller.commit_context()
+            else:
+                from vllm.model_executor.layers.fused_moe.expert_selection import (
+                    bind_expert_selection_profile,
+                )
+
+                bind_expert_selection_profile(
+                    self.model_runner.get_model(), expert_selection_profile
+                )
+                self.expert_context_controller.adopt_startup_context(
+                    startup_context.context_id
+                )
 
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
@@ -465,6 +502,122 @@ class Worker(WorkerBase):
                 self.vllm_config,
                 self.device,
                 self.model_runner.get_model(),
+            )
+
+    def _expert_context_error(self, error: Exception) -> dict[str, object]:
+        return {
+            "ok": False,
+            "rank": self.rank,
+            "error": str(error),
+            "error_type": type(error).__name__,
+        }
+
+    def register_expert_context(
+        self,
+        context_id: str,
+        layers: dict[str, object],
+        creation_source: str = "api",
+        metadata: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Register a bounded context payload without changing routing."""
+        try:
+            if self.expert_context_controller is None:
+                raise RuntimeError("expert context controller is not initialized")
+            context = self.expert_context_controller.register_payload(
+                {
+                    "context_id": context_id,
+                    "layers": layers,
+                    "creation_source": creation_source,
+                    "metadata": metadata or {},
+                }
+            )
+            return {"ok": True, "rank": self.rank, **context.to_dict()}
+        except Exception as error:
+            return self._expert_context_error(error)
+
+    def prepare_expert_context(self, context_id: str) -> dict[str, object]:
+        """Validate and materialize a resident context without mutating routers."""
+        try:
+            if self.expert_context_controller is None:
+                raise RuntimeError("expert context controller is not initialized")
+            context = self.expert_context_controller.prepare_context(context_id)
+            return {"ok": True, "rank": self.rank, **context.to_dict()}
+        except Exception as error:
+            return self._expert_context_error(error)
+
+    def commit_expert_context(self) -> dict[str, object]:
+        """Commit the prepared context and synchronize this worker."""
+        try:
+            if self.expert_context_controller is None:
+                raise RuntimeError("expert context controller is not initialized")
+            context = self.expert_context_controller.commit_context()
+            return {
+                "ok": True,
+                "rank": self.rank,
+                **context.to_dict(),
+                **self.expert_context_controller.current(),
+            }
+        except Exception as error:
+            return self._expert_context_error(error)
+
+    def rollback_expert_context(self) -> dict[str, object]:
+        """Restore the context active before the latest prepare operation."""
+        try:
+            if self.expert_context_controller is None:
+                raise RuntimeError("expert context controller is not initialized")
+            context = self.expert_context_controller.rollback_context()
+            return {
+                "ok": True,
+                "rank": self.rank,
+                **context.to_dict(),
+                **self.expert_context_controller.current(),
+            }
+        except Exception as error:
+            return self._expert_context_error(error)
+
+    def get_expert_context(self) -> dict[str, object]:
+        """Return this worker's committed expert context."""
+        try:
+            if self.expert_context_controller is None:
+                raise RuntimeError("expert context controller is not initialized")
+            return {
+                "ok": True,
+                "rank": self.rank,
+                **self.expert_context_controller.current(),
+            }
+        except Exception as error:
+            return self._expert_context_error(error)
+
+    def get_expert_context_capabilities(self) -> dict[str, object]:
+        """Return actual loaded routing topology and hot-switch capability."""
+        try:
+            if self.expert_context_controller is None:
+                raise RuntimeError("expert context controller is not initialized")
+            return {
+                "ok": True,
+                "rank": self.rank,
+                **self.expert_context_controller.capabilities(),
+            }
+        except Exception as error:
+            return self._expert_context_error(error)
+
+    def _validate_expert_context_batch(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        if not getattr(self, "expert_context_enforced", False):
+            return
+        if scheduler_output.total_num_scheduled_tokens == 0:
+            return
+        if self.expert_context_controller is None:
+            raise RuntimeError("expert context controller is not initialized")
+        expected = scheduler_output.expert_context_fingerprint
+        if expected is None:
+            raise RuntimeError("scheduled request lacks expert context provenance")
+        actual = self.expert_context_controller.active_context.fingerprint
+        if expected != actual:
+            raise RuntimeError(
+                "scheduled request expert context does not match the worker's "
+                "active routing context"
             )
 
     def update_config(self, overrides: dict[str, Any]) -> None:
@@ -1041,6 +1194,7 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        self._validate_expert_context_batch(scheduler_output)
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
             for handle in self._pp_send_work:

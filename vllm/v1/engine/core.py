@@ -100,6 +100,20 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
+def _finish_pause_after_idle(
+    engine: "EngineCore", future: Future[Any], clear_cache: bool
+) -> None:
+    try:
+        if clear_cache:
+            engine._reset_caches()
+    except BaseException as error:
+        if not future.done():
+            future.set_exception(error)
+    else:
+        if not future.done():
+            future.set_result(None)
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -815,12 +829,15 @@ class EngineCore:
         # reset_connector=True so external connectors clear alongside
         # local caches, matching the pause_generation(clear_cache=True)
         # contract. No-op when no connector is configured.
-        self.reset_prefix_cache(
+        reset_successful = self.reset_prefix_cache(
             reset_running_requests=reset_running_requests,
             reset_connector=reset_connector,
         )
+        if not reset_successful:
+            raise RuntimeError("Failed to reset all KV prefix and connector caches")
         self.reset_mm_cache()
         self.reset_encoder_cache()
+        self.scheduler.reset_routed_experts_cache()
 
     def pause_scheduler(
         self, mode: PauseMode = "abort", clear_cache: bool = True
@@ -1848,11 +1865,6 @@ class EngineCoreProc(EngineCore):
         if mode not in ("keep", "abort", "wait"):
             raise ValueError(f"Invalid pause mode: {mode}")
 
-        def engine_idle_callback(engine: "EngineCoreProc", future: Future[Any]) -> None:
-            if clear_cache:
-                engine._reset_caches()
-            future.set_result(None)
-
         if mode == "abort":
             aborted_reqs = self.scheduler.finish_requests(
                 None, RequestStatus.FINISHED_ABORTED
@@ -1868,7 +1880,13 @@ class EngineCoreProc(EngineCore):
             return None
 
         future = Future[Any]()
-        self._idle_state_callbacks.append(partial(engine_idle_callback, future=future))
+        self._idle_state_callbacks.append(
+            partial(
+                _finish_pause_after_idle,
+                future=future,
+                clear_cache=clear_cache,
+            )
+        )
         return future
 
     def _pause_complete(self) -> bool:

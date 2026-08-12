@@ -181,6 +181,7 @@ class ServingDerender(BaseServing):
             usage=usage,
             prompt_logprobs=gen.prompt_logprobs,
             kv_transfer_params=gen.kv_transfer_params,
+            expert_context_fingerprint=gen.expert_context_fingerprint,
         )
 
     async def derender_completion_response(
@@ -215,6 +216,14 @@ class ServingDerender(BaseServing):
         )
 
         first = request.generate_responses[0]
+        context_fingerprint = first.expert_context_fingerprint
+        if any(
+            response.expert_context_fingerprint != context_fingerprint
+            for response in request.generate_responses[1:]
+        ):
+            return self.create_error_response(
+                "generate_responses use different expert contexts"
+            )
         kv_params = first.kv_transfer_params
         if any(
             r.kv_transfer_params != kv_params for r in request.generate_responses[1:]
@@ -246,6 +255,7 @@ class ServingDerender(BaseServing):
             choices=choices,
             usage=usage,
             kv_transfer_params=kv_params,
+            expert_context_fingerprint=context_fingerprint,
         )
 
     async def derender_chat_stream_response(
@@ -289,6 +299,9 @@ class ServingDerender(BaseServing):
                 len(c.token_ids) for c in request.generate_chunk.choices if c.token_ids
             ),
         )
+        chunk.expert_context_fingerprint = (
+            request.generate_chunk.expert_context_fingerprint
+        )
         return chunk, updated_state
 
     async def derender_completion_stream_response(
@@ -329,6 +342,9 @@ class ServingDerender(BaseServing):
             sum(
                 len(c.token_ids) for c in request.generate_chunk.choices if c.token_ids
             ),
+        )
+        chunk.expert_context_fingerprint = (
+            request.generate_chunk.expert_context_fingerprint
         )
         return chunk, updated_state
 

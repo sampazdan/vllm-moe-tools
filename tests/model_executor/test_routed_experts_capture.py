@@ -12,6 +12,10 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.config.compilation import CompilationMode
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+from vllm.model_executor.layers.fused_moe.expert_context import (
+    ExpertContextController,
+    ExpertContextSpec,
+)
 from vllm.model_executor.layers.fused_moe.expert_selection import (
     ExpertSelectionProfile,
     bind_expert_selection_profile,
@@ -47,7 +51,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
 )
 
-pytestmark = pytest.mark.cpu_test
+pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
 _REC_MODULE = "vllm.model_executor.layers.fused_moe.routed_experts_capturer"
 
@@ -129,8 +133,8 @@ def _make_model_config(hf_config):
         ),
     )
     model_config.get_num_experts = lambda: hf_config.num_experts
-    model_config.get_num_experts_per_tok = lambda: (
-        ModelConfig.get_num_experts_per_tok(model_config)
+    model_config.get_num_experts_per_tok = lambda: ModelConfig.get_num_experts_per_tok(
+        model_config
     )
     model_config.get_total_num_hidden_layers = lambda: hf_config.num_hidden_layers
     return model_config
@@ -220,6 +224,12 @@ def test_routed_experts_manager_stores_paired_weights_by_slot():
     np.testing.assert_array_equal(
         manager.get_weights([0], 2, token_start=1), weights[:1]
     )
+
+    manager.reset()
+
+    assert not manager.routed_experts_by_slot.any()
+    assert manager.routed_expert_weights_by_slot is not None
+    assert not manager.routed_expert_weights_by_slot.any()
 
 
 def test_base_router_capture_pre_eplb_mapping():
@@ -593,6 +603,215 @@ def test_no_profile_and_all_experts_profile_match_baseline():
 
     assert torch.equal(profiled[0], baseline[0])
     assert torch.equal(profiled[1], baseline[1])
+
+
+def test_worker_rejects_batch_stamped_with_a_different_context():
+    from vllm.v1.worker.gpu_worker import Worker
+
+    worker = Worker.__new__(Worker)
+    worker.expert_context_enforced = True
+    worker.expert_context_controller = SimpleNamespace(
+        active_context=SimpleNamespace(fingerprint="a" * 64)
+    )
+    scheduler_output = SimpleNamespace(
+        total_num_scheduled_tokens=1,
+        expert_context_fingerprint="b" * 64,
+    )
+
+    with pytest.raises(RuntimeError, match="active routing context"):
+        worker._validate_expert_context_batch(scheduler_output)
+
+
+def _make_expert_context_controller(
+    monkeypatch,
+    routers,
+    *,
+    synchronize=lambda: None,
+):
+    class DummyMoERunner:
+        def __init__(self, layer_id, router):
+            self.layer_id = layer_id
+            self.router = router
+            self._quant_method = SimpleNamespace(is_monolithic=False)
+            self.moe_config = SimpleNamespace(
+                num_logical_experts=router.global_num_experts,
+                top_k=router.top_k,
+                device=torch.device("cpu"),
+            )
+
+    import vllm.model_executor.layers.fused_moe.layer as fused_moe_layer
+
+    monkeypatch.setattr(fused_moe_layer, "MoERunner", DummyMoERunner)
+    runners = [
+        DummyMoERunner(layer_id, router)
+        for layer_id, router in enumerate(routers, start=2)
+    ]
+    model = SimpleNamespace(modules=lambda: runners)
+    return ExpertContextController(
+        model,
+        model_identity={"model": "test/model", "revision": "fixed"},
+        synchronize=synchronize,
+    )
+
+
+def test_expert_context_canonicalizes_omitted_layers_and_fingerprints(
+    monkeypatch,
+):
+    routers = [
+        DummyRouter(top_k=2, global_num_experts=4),
+        DummyRouter(top_k=2, global_num_experts=4),
+    ]
+    controller = _make_expert_context_controller(monkeypatch, routers)
+    context_a = controller.register_context(
+        ExpertContextSpec(
+            context_id="a",
+            layers={2: frozenset({0, 1})},
+            metadata={"label": "first"},
+        )
+    )
+    context_a_alias = controller.register_context(
+        ExpertContextSpec(
+            context_id="a-alias",
+            layers={2: frozenset({1, 0})},
+            metadata={"label": "renamed"},
+        )
+    )
+    context_b = controller.register_context(
+        ExpertContextSpec(
+            context_id="b",
+            layers={3: frozenset({2, 3})},
+        )
+    )
+
+    assert context_a.keep_for_layer(3) == (0, 1, 2, 3)
+    assert len(context_a.fingerprint) == 64
+    assert all(character in "0123456789abcdef" for character in context_a.fingerprint)
+    assert context_a.profile_fingerprint == context_a_alias.profile_fingerprint
+    assert context_a.fingerprint == context_a_alias.fingerprint
+
+    controller.prepare_context("a")
+    controller.commit_context()
+    assert routers[0].expert_eligibility_mask.tolist() == [True, True, False, False]
+    controller.prepare_context("b")
+    controller.commit_context()
+
+    assert routers[0].expert_eligibility_mask.tolist() == [True, True, True, True]
+    assert routers[1].expert_eligibility_mask.tolist() == [False, False, True, True]
+    assert context_b.topology_fingerprint == controller.topology.fingerprint
+
+
+def test_expert_context_preserves_all_router_buffer_identities(monkeypatch):
+    correction_bias = torch.arange(4, dtype=torch.float32)
+    router = FusedTopKBiasRouter(
+        top_k=2,
+        global_num_experts=4,
+        e_score_correction_bias=correction_bias,
+    )
+    controller = _make_expert_context_controller(monkeypatch, [router])
+    assert router.expert_eligibility_mask is not None
+    assert router._expert_ineligibility_mask is not None
+    assert router._eligibility_correction_bias is not None
+    identities = (
+        router.expert_eligibility_mask.data_ptr(),
+        router._expert_ineligibility_mask.data_ptr(),
+        router._eligibility_correction_bias.data_ptr(),
+    )
+    controller.register_context(
+        ExpertContextSpec(
+            context_id="masked",
+            layers={2: frozenset({0, 1})},
+        )
+    )
+
+    for context_id in ("masked", "baseline", "masked", "baseline"):
+        controller.prepare_context(context_id)
+        controller.commit_context()
+        assert identities == (
+            router.expert_eligibility_mask.data_ptr(),
+            router._expert_ineligibility_mask.data_ptr(),
+            router._eligibility_correction_bias.data_ptr(),
+        )
+
+    assert router.expert_eligibility_mask.tolist() == [True] * 4
+    assert router._expert_ineligibility_mask.tolist() == [False] * 4
+    assert router._eligibility_correction_bias.tolist() == correction_bias.tolist()
+
+
+def test_expert_context_prepare_validates_every_layer_before_mutation(monkeypatch):
+    first = DummyRouter(top_k=2, global_num_experts=8)
+    unsafe = GroupedTopKRouter(
+        top_k=4,
+        global_num_experts=8,
+        num_expert_group=4,
+        topk_group=2,
+    )
+    controller = _make_expert_context_controller(monkeypatch, [first, unsafe])
+    first_identity = first.expert_eligibility_mask.data_ptr()
+    controller.register_context(
+        ExpertContextSpec(
+            context_id="unsafe",
+            layers={
+                2: frozenset({0, 1}),
+                3: frozenset({0, 2, 4, 6}),
+            },
+        )
+    )
+
+    with pytest.raises(ValueError, match="cannot guarantee top_k"):
+        controller.prepare_context("unsafe")
+
+    assert first.expert_eligibility_mask.data_ptr() == first_identity
+    assert first.expert_eligibility_mask.tolist() == [True] * 8
+    assert controller.active_context.context_id == "baseline"
+
+
+def test_expert_context_commit_failure_restores_previous_context(monkeypatch):
+    class FailOnceRouter(DummyRouter):
+        fail_next = False
+
+        def set_expert_eligibility_mask(self, mask, **kwargs):
+            if self.fail_next:
+                self.fail_next = False
+                raise RuntimeError("injected commit failure")
+            return super().set_expert_eligibility_mask(mask, **kwargs)
+
+    first = DummyRouter(top_k=2, global_num_experts=4)
+    second = FailOnceRouter(top_k=2, global_num_experts=4)
+    sync_calls = []
+    controller = _make_expert_context_controller(
+        monkeypatch, [first, second], synchronize=lambda: sync_calls.append(True)
+    )
+    controller.register_context(
+        ExpertContextSpec(
+            context_id="masked",
+            layers={
+                2: frozenset({0, 1}),
+                3: frozenset({2, 3}),
+            },
+        )
+    )
+    controller.prepare_context("masked")
+    second.fail_next = True
+
+    with pytest.raises(RuntimeError, match="injected commit failure"):
+        controller.commit_context()
+
+    assert controller.active_context.context_id == "baseline"
+    assert first.expert_eligibility_mask.tolist() == [True] * 4
+    assert second.expert_eligibility_mask.tolist() == [True] * 4
+    assert len(sync_calls) == 2
+
+
+def test_expert_context_rejects_context_id_fingerprint_collision(monkeypatch):
+    controller = _make_expert_context_controller(
+        monkeypatch, [DummyRouter(top_k=2, global_num_experts=4)]
+    )
+    controller.register_context(ExpertContextSpec("candidate", {2: frozenset({0, 1})}))
+
+    with pytest.raises(ValueError, match="different fingerprint"):
+        controller.register_context(
+            ExpertContextSpec("candidate", {2: frozenset({2, 3})})
+        )
 
 
 def test_public_binding_only_visits_target_model(monkeypatch):

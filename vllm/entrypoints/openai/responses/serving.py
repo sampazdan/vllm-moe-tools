@@ -946,6 +946,7 @@ class OpenAIServingResponses(GenerateBaseServing):
             usage=usage,
             kv_transfer_params=context.kv_transfer_params,
             ec_transfer_params=context.ec_transfer_params,
+            expert_context_fingerprint=context.expert_context_fingerprint,
         )
 
         if request.store:

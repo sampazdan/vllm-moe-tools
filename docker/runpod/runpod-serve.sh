@@ -8,6 +8,7 @@ export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/workspace/cache/torc
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/workspace/cache/triton}"
 
 model="${RUNPOD_VLLM_MODEL:-Qwen/Qwen3.6-35B-A3B-FP8}"
+revision="${RUNPOD_VLLM_REVISION:-}"
 host="${RUNPOD_VLLM_HOST:-0.0.0.0}"
 port="${RUNPOD_VLLM_PORT:-8000}"
 max_model_len="${RUNPOD_VLLM_MAX_MODEL_LEN:-4096}"
@@ -35,6 +36,10 @@ require_integer() {
 
 if [[ -z "${model}" || -z "${host}" ]]; then
     echo "RUNPOD_VLLM_MODEL and RUNPOD_VLLM_HOST cannot be empty." >&2
+    exit 2
+fi
+if [[ -n "${revision}" && ! "${revision}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "RUNPOD_VLLM_REVISION must be a 40-character lowercase hex commit." >&2
     exit 2
 fi
 require_integer RUNPOD_VLLM_PORT "${port}" 1 65535
@@ -69,6 +74,10 @@ args=(
     --max-num-seqs "${max_num_seqs}"
 )
 
+if [[ -n "${revision}" ]]; then
+    args+=(--revision "${revision}")
+fi
+
 if [[ "${enable_request_metrics}" == "1" ]]; then
     args+=(--enable-per-request-metrics)
 fi
@@ -96,6 +105,7 @@ mkdir -p /workspace/logs
 {
     echo "source_ref=${RUNPOD_VLLM_SOURCE_REF:-unknown}"
     echo "model=${model}"
+    echo "revision=${revision:-unpinned}"
     echo "profile=${MOE_PROFILE:-baseline}"
     echo "capture_routing=${RUNPOD_CAPTURE_ROUTING:-0}"
     echo "request_metrics=${enable_request_metrics}"

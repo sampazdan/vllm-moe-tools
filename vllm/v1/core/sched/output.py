@@ -226,6 +226,8 @@ class SchedulerOutput:
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
 
+    expert_context_fingerprint: str | None = None
+
     scheduled_encoder_input_stats: ScheduledEncoderInputStats | None = None
 
     # Request IDs that are preempted in this step.

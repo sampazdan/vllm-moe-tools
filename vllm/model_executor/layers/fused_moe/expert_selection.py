@@ -98,6 +98,7 @@ def bind_expert_selection_profile(
         raise ValueError(
             f"expert selection profile has unknown layers: {sorted(unknown)}"
         )
+    bindings: list[tuple[BaseRouter, torch.Tensor, int]] = []
     for layer_id, keep in profile.layers.items():
         runner = runners[layer_id]
         if runner._quant_method.is_monolithic or not isinstance(
@@ -123,6 +124,11 @@ def bind_expert_selection_profile(
             device=runner.moe_config.device,
         )
         mask[list(keep)] = True
+        router.validate_expert_eligibility_mask(
+            mask, logical_num_experts=logical_num_experts
+        )
+        bindings.append((router, mask, logical_num_experts))
+    for router, mask, logical_num_experts in bindings:
         router.set_expert_eligibility_mask(
             mask, logical_num_experts=logical_num_experts
         )

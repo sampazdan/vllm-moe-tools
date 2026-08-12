@@ -377,6 +377,16 @@ class InputProcessor:
                     )
                 )
 
+        from vllm.model_executor.layers.fused_moe.expert_context import (
+            get_frontend_expert_context,
+        )
+
+        _, expert_context_fingerprint, context_transition = (
+            get_frontend_expert_context()
+        )
+        if context_transition:
+            raise ValueError("expert context transition in progress")
+
         return EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,
@@ -393,6 +403,7 @@ class InputProcessor:
             trace_headers=trace_headers,
             resumable=resumable,
             session_id=session_id,
+            expert_context_fingerprint=expert_context_fingerprint,
         )
 
     def _validate_prompt_len(

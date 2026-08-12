@@ -531,6 +531,7 @@ class OpenAIServingChat(GenerateBaseServing):
                                 else None
                             ),
                             prompt_text=prompt_text,
+                            expert_context_fingerprint=(res.expert_context_fingerprint),
                         )
 
                         # if continuous usage stats are requested, add it
@@ -569,6 +570,9 @@ class OpenAIServingChat(GenerateBaseServing):
                                     created=created_time,
                                     choices=[choice_data],
                                     model=model_name,
+                                    expert_context_fingerprint=(
+                                        res.expert_context_fingerprint
+                                    ),
                                 )
                                 if include_continuous_usage:
                                     chunk.usage = UsageInfo(
@@ -739,6 +743,7 @@ class OpenAIServingChat(GenerateBaseServing):
                         created=created_time,
                         choices=[choice_data],
                         model=model_name,
+                        expert_context_fingerprint=(res.expert_context_fingerprint),
                     )
                     # Stamp the fingerprint on terminal chunks only (those with
                     # finish_reason set). When ``include_usage`` is on, the
@@ -803,6 +808,11 @@ class OpenAIServingChat(GenerateBaseServing):
                     usage=final_usage,
                     system_fingerprint=self.system_fingerprint,
                     metrics=stream_per_request_metrics,
+                    expert_context_fingerprint=(
+                        last_res.expert_context_fingerprint
+                        if last_res is not None
+                        else None
+                    ),
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(
                     exclude_unset=True, exclude_none=True
@@ -1041,6 +1051,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 ),
                 routed_experts=routed_experts_b64,
                 routed_expert_weights=routed_expert_weights_b64,
+                expert_context_fingerprint=output.expert_context_fingerprint,
             )
             choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
 
@@ -1112,6 +1123,7 @@ class OpenAIServingChat(GenerateBaseServing):
             kv_transfer_params=final_res.kv_transfer_params,
             ec_transfer_params=final_res.ec_transfer_params,
             metrics=per_request_metrics,
+            expert_context_fingerprint=final_res.expert_context_fingerprint,
         )
 
         # Log complete response if output logging is enabled

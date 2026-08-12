@@ -620,6 +620,7 @@ class CompletionResponseChoice(OpenAIBaseModel):
     routed_experts: str | None = None
     # Weights paired elementwise with ``routed_experts``, encoded identically.
     routed_expert_weights: str | None = None
+    expert_context_fingerprint: str | None = None
 
 
 class CompletionResponse(OpenAIBaseModel):
@@ -640,6 +641,7 @@ class CompletionResponse(OpenAIBaseModel):
         default=None, description="ECTransfer parameters."
     )
     metrics: PerRequestTimingMetrics | None = None
+    expert_context_fingerprint: str | None = None
 
 
 class CompletionResponseStreamChoice(OpenAIBaseModel):
@@ -672,3 +674,4 @@ class CompletionStreamResponse(OpenAIBaseModel):
     # without the per-chunk serialization overhead.
     system_fingerprint: str | None = None
     metrics: PerRequestTimingMetrics | None = None
+    expert_context_fingerprint: str | None = None

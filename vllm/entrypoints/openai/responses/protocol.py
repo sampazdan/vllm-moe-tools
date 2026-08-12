@@ -688,6 +688,7 @@ class ResponsesResponse(OpenAIBaseModel):
     ec_transfer_params: dict[str, Any] | None = Field(
         default=None, description="ECTransfer parameters."
     )
+    expert_context_fingerprint: str | None = None
 
     # --8<-- [start:responses-response-extra-params]
     # These are populated when enable_response_messages is set to True
@@ -734,6 +735,7 @@ class ResponsesResponse(OpenAIBaseModel):
         output_messages: ResponseInputOutputMessage | None = None,
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
+        expert_context_fingerprint: str | None = None,
     ) -> "ResponsesResponse":
         incomplete_details: IncompleteDetails | None = None
         if status == "incomplete":
@@ -775,6 +777,7 @@ class ResponsesResponse(OpenAIBaseModel):
             usage=usage,
             kv_transfer_params=kv_transfer_params,
             ec_transfer_params=ec_transfer_params,
+            expert_context_fingerprint=expert_context_fingerprint,
         )
 
 

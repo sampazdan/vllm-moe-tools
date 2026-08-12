@@ -395,6 +395,15 @@ async def init_app_state(
     state.log_stats = not args.disable_log_stats
     state.vllm_config = vllm_config
     state.args = args
+    if (
+        os.environ.get("VLLM_MOE_EXPERT_CONTEXT_CONTROL_TOKEN") is not None
+        or vllm_config.model_config.moe_expert_selection_profile is not None
+    ):
+        from vllm.entrypoints.serve.expert_context.api_router import (
+            initialize_frontend_context,
+        )
+
+        await initialize_frontend_context(engine_client)
     resolved_chat_template = load_chat_template(args.chat_template)
 
     # Merge default_mm_loras into the static lora_modules

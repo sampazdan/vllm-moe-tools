@@ -32,6 +32,7 @@ class CompletionOutput:
             position if the logprobs are requested.
         routed_experts: The expert IDs selected at each routed layer.
         routed_expert_weights: Weights paired elementwise with `routed_experts`.
+        expert_context_fingerprint: Immutable context used for generation.
         finish_reason: The reason why the sequence is finished.
         stop_reason: The stop string or token id that caused the completion
             to stop, None if the completion finished for some other reason
@@ -46,6 +47,7 @@ class CompletionOutput:
     logprobs: SampleLogprobs | None
     routed_experts: np.ndarray | None = None  # [seq_len,layer_num,topk]
     routed_expert_weights: np.ndarray | None = None  # [seq_len,layer_num,topk]
+    expert_context_fingerprint: str | None = None
     finish_reason: str | None = None
     stop_reason: int | str | None = None
     lora_request: LoRARequest | None = None
@@ -127,6 +129,7 @@ class RequestOutput:
         encoder_prompt_token_ids: list[int] | None = None,
         num_cached_tokens: int | None = None,
         num_cache_creation_tokens: int | None = None,
+        expert_context_fingerprint: str | None = None,
         *,
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
@@ -150,6 +153,7 @@ class RequestOutput:
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
         self.num_cache_creation_tokens = num_cache_creation_tokens
+        self.expert_context_fingerprint = expert_context_fingerprint
         self.kv_transfer_params = kv_transfer_params
         self.ec_transfer_params = ec_transfer_params
 
@@ -159,6 +163,8 @@ class RequestOutput:
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
         self.ec_transfer_params = next_output.ec_transfer_params
+        if self.expert_context_fingerprint != next_output.expert_context_fingerprint:
+            raise ValueError("cannot merge outputs from different expert contexts")
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):

@@ -417,6 +417,12 @@ class RoutedExpertsManager:
                 self.routed_expert_weights_by_slot.nbytes / 1e9,
             )
 
+    def reset(self) -> None:
+        """Invalidate routing data stored in physical KV-cache slots."""
+        self.routed_experts_by_slot.fill(0)
+        if self.routed_expert_weights_by_slot is not None:
+            self.routed_expert_weights_by_slot.fill(0)
+
     def store_batch(
         self,
         data: np.ndarray,
