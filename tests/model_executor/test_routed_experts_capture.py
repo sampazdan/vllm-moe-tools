@@ -700,6 +700,38 @@ def test_expert_context_canonicalizes_omitted_layers_and_fingerprints(
     assert context_b.topology_fingerprint == controller.topology.fingerprint
 
 
+def test_expert_context_full_mask_fingerprint_contract(monkeypatch):
+    controller = _make_expert_context_controller(
+        monkeypatch,
+        [
+            DummyRouter(top_k=2, global_num_experts=4),
+            DummyRouter(top_k=2, global_num_experts=4),
+        ],
+    )
+    sparse = controller.register_payload(
+        {
+            "context_id": "sparse",
+            "layers": {"2": {"keep": [1, 0]}},
+        }
+    )
+    explicit = controller.register_payload(
+        {
+            "context_id": "explicit",
+            "layers": {
+                "3": {"keep": [3, 2, 1, 0]},
+                "2": {"keep": [0, 1]},
+            },
+        }
+    )
+
+    assert sparse.layers == ((2, (0, 1)), (3, (0, 1, 2, 3)))
+    assert explicit.layers == sparse.layers
+    assert sparse.profile_fingerprint == explicit.profile_fingerprint
+    assert sparse.profile_fingerprint == (
+        "a17d14598059438d9adeca3139d5645070d130c45d65a30e940001894366914e"
+    )
+
+
 def test_expert_context_preserves_all_router_buffer_identities(monkeypatch):
     correction_bias = torch.arange(4, dtype=torch.float32)
     router = FusedTopKBiasRouter(

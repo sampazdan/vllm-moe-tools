@@ -18,6 +18,7 @@ import torch
 _CONTEXT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 _MAX_CONTEXTS = 64
 _MAX_METADATA_BYTES = 8192
+_PROFILE_FINGERPRINT_VERSION = 1
 _frontend_context_id: str | None = None
 _frontend_context_fingerprint: str | None = None
 _frontend_context_transition = False
@@ -64,6 +65,18 @@ def _canonical_json(value: object) -> bytes:
 
 def _fingerprint(value: object) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
+
+
+def _canonical_full_mask_payload(
+    layers: Sequence[tuple[int, Sequence[int]]],
+) -> dict[str, object]:
+    return {
+        "version": _PROFILE_FINGERPRINT_VERSION,
+        "layers": [
+            {"layer_id": layer_id, "keep": sorted(keep)}
+            for layer_id, keep in sorted(layers, key=lambda item: item[0])
+        ],
+    }
 
 
 def _normalize_context_id(context_id: object) -> str:
@@ -252,7 +265,7 @@ class ExpertContext:
             raise ValueError(f"expert context has unknown layers: {sorted(unknown)}")
 
         full_layers: list[tuple[int, tuple[int, ...]]] = []
-        for layer in topology.layers:
+        for layer in sorted(topology.layers, key=lambda item: item.layer_id):
             keep = spec.layers.get(layer.layer_id, frozenset(range(layer.num_experts)))
             invalid = sorted(
                 expert_id
@@ -269,10 +282,7 @@ class ExpertContext:
                 )
             full_layers.append((layer.layer_id, tuple(sorted(keep))))
 
-        canonical_layers = [
-            {"layer_id": layer_id, "keep": list(keep)} for layer_id, keep in full_layers
-        ]
-        profile_fingerprint = _fingerprint({"version": 1, "layers": canonical_layers})
+        profile_fingerprint = _fingerprint(_canonical_full_mask_payload(full_layers))
         fingerprint = _fingerprint(
             {
                 "version": 1,

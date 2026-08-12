@@ -195,6 +195,30 @@ def test_control_api_requires_loopback_and_dedicated_token(monkeypatch):
         assert capabilities["worker_process_ids"] == [42]
 
 
+def test_current_rejects_worker_profile_fingerprint_disagreement(monkeypatch):
+    class DisagreeingCurrentEngine(FakeEngineClient):
+        async def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
+            results = await super().collective_rpc(method, timeout, args, kwargs)
+            if method != "get_expert_context":
+                return results
+            disagreeing = {
+                **results[0],
+                "rank": 1,
+                "profile_fingerprint": "f" * 64,
+            }
+            return [results[0], disagreeing]
+
+    app = _app(monkeypatch, DisagreeingCurrentEngine())
+    with TestClient(app, client=("127.0.0.1", 1234)) as client:
+        response = client.get(
+            "/v1/internal/moe-contexts/current",
+            headers=_HEADERS,
+        )
+
+    assert response.status_code == 409
+    assert "workers disagree on profile_fingerprint" in response.json()["detail"]
+
+
 def test_control_api_registers_and_activates_transactionally(monkeypatch):
     engine = FakeEngineClient()
     app = _app(monkeypatch, engine)
@@ -226,6 +250,40 @@ def test_control_api_registers_and_activates_transactionally(monkeypatch):
         "commit_expert_context",
         "resume_generation",
     ]
+
+
+@pytest.mark.parametrize(
+    ("field", "mismatch"),
+    [
+        ("context_id", "different-context"),
+        ("context_fingerprint", "f" * 64),
+        ("profile_fingerprint", "f" * 64),
+        ("topology_fingerprint", "f" * 64),
+        ("layers", {"2": {"keep": [0, 2]}}),
+    ],
+)
+def test_control_api_rejects_register_worker_disagreement(monkeypatch, field, mismatch):
+    class DisagreeingRegisterEngine(FakeEngineClient):
+        async def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
+            results = await super().collective_rpc(method, timeout, args, kwargs)
+            if method != "register_expert_context":
+                return results
+            disagreeing = {**results[0], "rank": 1, field: mismatch}
+            return [results[0], disagreeing]
+
+    app = _app(monkeypatch, DisagreeingRegisterEngine())
+    with TestClient(app, client=("127.0.0.1", 1234)) as client:
+        response = client.post(
+            "/v1/internal/moe-contexts/register",
+            headers=_HEADERS,
+            json={
+                "context_id": "registered",
+                "layers": {"2": {"keep": [0, 1]}},
+            },
+        )
+
+    assert response.status_code == 422
+    assert f"workers disagree on {field}" in response.json()["detail"]
 
 
 def test_control_api_rolls_back_and_resumes_after_commit_failure(monkeypatch):

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import os
 import secrets
 import time
@@ -124,7 +125,16 @@ def _require_success(
         raise RuntimeError(f"expert context worker operation failed: {details}")
     first = results[0]
     for field in fields:
-        values = {result.get(field) for result in results}
+        values = {
+            json.dumps(
+                result.get(field),
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            for result in results
+        }
         if len(values) != 1:
             raise RuntimeError(
                 f"expert context workers disagree on {field}: "
@@ -171,6 +181,7 @@ async def _current_workers(request: Request) -> tuple[dict[str, Any], list[int]]
         fields=(
             "active_context_id",
             "active_context_fingerprint",
+            "profile_fingerprint",
             "topology_fingerprint",
         ),
     )
@@ -498,7 +509,13 @@ async def register(body: RegisterRequest, request: Request):
             )
             first = _require_success(
                 results,
-                fields=("context_fingerprint", "topology_fingerprint"),
+                fields=(
+                    "context_id",
+                    "context_fingerprint",
+                    "profile_fingerprint",
+                    "topology_fingerprint",
+                    "layers",
+                ),
             )
         return {key: value for key, value in first.items() if key not in {"ok", "rank"}}
     except Exception as error:
