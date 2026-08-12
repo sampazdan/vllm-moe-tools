@@ -53,6 +53,7 @@ from vllm.distributed.weight_transfer import (
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
+from vllm.model_load_progress import model_load_progress, track_model_load_phase
 from vllm.multimodal.gpu_ipc_memory import reserve_mm_ipc_gpu_memory
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
@@ -304,6 +305,10 @@ class Worker(WorkerBase):
             torch._C._accelerator_setAllocatorSettings(f"max_split_size_mb:{restore}")
 
     @instrument(span_name="Init device")
+    @track_model_load_phase(
+        "initializing_distributed_workers",
+        "Initializing the accelerator and distributed worker",
+    )
     def init_device(self):
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
@@ -435,6 +440,10 @@ class Worker(WorkerBase):
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
+    @track_model_load_phase(
+        "loading_weights",
+        "Constructing the model and loading its checkpoint weights",
+    )
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         expert_selection_profile = None
         if profile_path := self.model_config.moe_expert_selection_profile:
@@ -873,15 +882,17 @@ class Worker(WorkerBase):
                 if not any(x in compile_range for x in all_sizes):
                     warmup_sizes.append(compile_range.end)
 
-        # We skip EPLB here since we don't want to record dummy metrics
-        for size in sorted(warmup_sizes, reverse=True):
-            logger.info("Compile and warming up model for size %d", size)
-            self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
+        self._run_startup_compile_warmups(warmup_sizes)
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
-        kernel_warmup(self)
+        with model_load_progress(
+            "warming",
+            "Executing registered model-kernel warmup hooks",
+            owner=self,
+        ):
+            kernel_warmup(self)
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
@@ -1026,6 +1037,32 @@ class Worker(WorkerBase):
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
         )
+
+    def _run_startup_compile_warmups(self, warmup_sizes: list[int]) -> None:
+        ordered_sizes = sorted(warmup_sizes, reverse=True)
+        report_progress = (
+            bool(ordered_sizes)
+            and self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
+            and not envs.VLLM_USE_AOT_COMPILE
+        )
+        progress = (
+            model_load_progress(
+                "compiling",
+                "Compiling configured startup model shapes",
+                owner=self,
+            )
+            if report_progress
+            else nullcontext()
+        )
+        with progress:
+            # We skip EPLB here since we don't want to record dummy metrics.
+            for size in ordered_sizes:
+                logger.info("Compile and warming up model for size %d", size)
+                self.model_runner._dummy_run(
+                    size,
+                    skip_eplb=True,
+                    remove_lora=False,
+                )
 
     def reset_mm_cache(self) -> None:
         self.model_runner.reset_mm_cache()

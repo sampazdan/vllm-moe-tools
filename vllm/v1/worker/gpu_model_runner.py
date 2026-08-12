@@ -100,6 +100,7 @@ from vllm.model_executor.offloader import (
     get_offloader,
     set_offloader,
 )
+from vllm.model_load_progress import track_model_load_phase
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import (
@@ -6840,6 +6841,13 @@ class GPUModelRunner(
         return int(total_estimate)
 
     @instrument(span_name="Capture model")
+    @track_model_load_phase(
+        "capturing_graphs",
+        "Capturing configured CUDA graphs for the model runner",
+        enabled_when=lambda runner: (
+            runner.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        ),
+    )
     def capture_model(self) -> int:
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
             logger.warning(

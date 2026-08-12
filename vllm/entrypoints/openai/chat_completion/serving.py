@@ -107,6 +107,14 @@ def _make_prompt_tokens_details(
     )
 
 
+def _encode_routing_array(value: np.ndarray | None) -> str | None:
+    if value is None:
+        return None
+    buffer = io.BytesIO()
+    np.save(buffer, value)
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
 class OpenAIServingChat(GenerateBaseServing):
     def __init__(
         self,
@@ -799,6 +807,12 @@ class OpenAIServingChat(GenerateBaseServing):
                         last_metrics, completion_tokens
                     )
 
+                final_output = (
+                    last_res.outputs[0]
+                    if last_res is not None and len(last_res.outputs) == 1
+                    else None
+                )
+
                 final_usage_chunk = ChatCompletionStreamResponse(
                     id=request_id,
                     object=chunk_object_type,
@@ -811,6 +825,16 @@ class OpenAIServingChat(GenerateBaseServing):
                     expert_context_fingerprint=(
                         last_res.expert_context_fingerprint
                         if last_res is not None
+                        else None
+                    ),
+                    routed_experts=_encode_routing_array(
+                        final_output.routed_experts
+                        if final_output is not None
+                        else None
+                    ),
+                    routed_expert_weights=_encode_routing_array(
+                        final_output.routed_expert_weights
+                        if final_output is not None
                         else None
                     ),
                 )
@@ -1021,18 +1045,10 @@ class OpenAIServingChat(GenerateBaseServing):
             # bytes, so we write the ndarray as a ``.npy`` byte stream
             # and base64-encode it. ``pybase64`` is ~3x faster than the
             # stdlib ``base64`` on large payloads thanks to SIMD.
-            routed_experts_b64 = None
-            if output.routed_experts is not None:
-                buf = io.BytesIO()
-                np.save(buf, output.routed_experts)
-                routed_experts_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-            routed_expert_weights_b64 = None
-            if output.routed_expert_weights is not None:
-                buf = io.BytesIO()
-                np.save(buf, output.routed_expert_weights)
-                routed_expert_weights_b64 = base64.b64encode(buf.getvalue()).decode(
-                    "ascii"
-                )
+            routed_experts_b64 = _encode_routing_array(output.routed_experts)
+            routed_expert_weights_b64 = _encode_routing_array(
+                output.routed_expert_weights
+            )
 
             choice_data = ChatCompletionResponseChoice(
                 index=output.index,

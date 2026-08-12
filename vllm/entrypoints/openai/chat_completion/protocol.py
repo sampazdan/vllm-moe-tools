@@ -183,6 +183,11 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     prompt_text: str | None = None
     metrics: PerRequestTimingMetrics | None = None
     expert_context_fingerprint: str | None = None
+    # Final usage-chunk telemetry for single-choice streams. These mirror the
+    # fields on ``ChatCompletionResponseChoice`` without repeating the arrays
+    # on every token chunk.
+    routed_experts: str | None = None
+    routed_expert_weights: str | None = None
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):

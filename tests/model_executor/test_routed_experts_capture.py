@@ -108,6 +108,16 @@ class DummyRouter(BaseRouter):
         return topk_ids + 10
 
 
+class LogitTopKRouter(DummyRouter):
+    def _compute_routing(
+        self, hidden_states, router_logits, indices_type, *, input_ids=None
+    ):
+        return torch.topk(router_logits, self.top_k)
+
+    def _apply_eplb_mapping(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        return topk_ids
+
+
 def _make_router(eplb_state: EplbLayerState | None = None) -> DummyRouter:
     return DummyRouter(
         top_k=2,
@@ -627,6 +637,7 @@ def _make_expert_context_controller(
     routers,
     *,
     synchronize=lambda: None,
+    device: torch.device | str = "cpu",
 ):
     class DummyMoERunner:
         def __init__(self, layer_id, router):
@@ -636,7 +647,7 @@ def _make_expert_context_controller(
             self.moe_config = SimpleNamespace(
                 num_logical_experts=router.global_num_experts,
                 top_k=router.top_k,
-                device=torch.device("cpu"),
+                device=torch.device(device),
             )
 
     import vllm.model_executor.layers.fused_moe.layer as fused_moe_layer
@@ -652,6 +663,146 @@ def _make_expert_context_controller(
         model_identity={"model": "test/model", "revision": "fixed"},
         synchronize=synchronize,
     )
+
+
+def test_cold_start_and_hot_switch_profiles_route_equivalently(monkeypatch):
+    logits = torch.tensor([[1.0, 4.0, 3.0, 2.0]])
+    layers = {2: frozenset({0, 2})}
+
+    cold_router = LogitTopKRouter(top_k=2, global_num_experts=4)
+    cold_controller = _make_expert_context_controller(monkeypatch, [cold_router])
+    cold_context = cold_controller.register_profile(
+        "startup-profile",
+        layers,
+        creation_source="startup-profile-file",
+    )
+    cold_controller.prepare_context(cold_context.context_id)
+    cold_controller.commit_context()
+    cold_output = cold_router.select_experts(torch.empty(1), logits.clone())
+
+    hot_router = LogitTopKRouter(top_k=2, global_num_experts=4)
+    hot_controller = _make_expert_context_controller(monkeypatch, [hot_router])
+    ineligibility_buffer = hot_router._expert_ineligibility_mask
+    assert ineligibility_buffer is not None
+    buffer_identity = ineligibility_buffer.data_ptr()
+    hot_context = hot_controller.register_profile(
+        "runtime-profile",
+        layers,
+        creation_source="api",
+    )
+    hot_controller.prepare_context(hot_context.context_id)
+    hot_controller.commit_context()
+    hot_output = hot_router.select_experts(torch.empty(1), logits.clone())
+
+    static_logits = logits.clone().masked_fill_(ineligibility_buffer, float("-inf"))
+    static_output = torch.topk(static_logits, hot_router.top_k)
+
+    assert cold_context.fingerprint == hot_context.fingerprint
+    torch.testing.assert_close(hot_output[0], cold_output[0])
+    assert torch.equal(hot_output[1], cold_output[1])
+    torch.testing.assert_close(static_output.values, hot_output[0])
+    assert torch.equal(static_output.indices, hot_output[1])
+    assert ineligibility_buffer.data_ptr() == buffer_identity
+
+    hot_controller.prepare_context("baseline")
+    hot_controller.commit_context()
+    baseline_output = hot_router.select_experts(torch.empty(1), logits.clone())
+    static_baseline_logits = logits.clone().masked_fill_(
+        ineligibility_buffer, float("-inf")
+    )
+    static_baseline = torch.topk(static_baseline_logits, hot_router.top_k)
+
+    torch.testing.assert_close(static_baseline.values, baseline_output[0])
+    assert torch.equal(static_baseline.indices, baseline_output[1])
+    assert ineligibility_buffer.data_ptr() == buffer_identity
+
+
+def test_expert_context_activation_does_not_reload_weights_or_compile(monkeypatch):
+    router = LogitTopKRouter(top_k=2, global_num_experts=4)
+    controller = _make_expert_context_controller(monkeypatch, [router])
+    model = controller.model
+    model.weight = torch.nn.Parameter(torch.arange(4, dtype=torch.float32))
+    model.reload_weights = Mock()
+    model.load_state_dict = Mock()
+    model.compile = Mock()
+    model.capture_model = Mock()
+    compile_model = Mock()
+    monkeypatch.setattr(torch, "compile", compile_model)
+    weight_before = model.weight.detach().clone()
+    weight_pointer = model.weight.data_ptr()
+    weight_version = model.weight._version
+    controller.register_context(
+        ExpertContextSpec(
+            context_id="masked",
+            layers={2: frozenset({0, 1})},
+        )
+    )
+
+    for context_id in ("masked", "baseline", "masked"):
+        controller.prepare_context(context_id)
+        controller.commit_context()
+
+    assert model.weight.data_ptr() == weight_pointer
+    assert model.weight._version == weight_version
+    torch.testing.assert_close(model.weight, weight_before)
+    model.reload_weights.assert_not_called()
+    model.load_state_dict.assert_not_called()
+    model.compile.assert_not_called()
+    model.capture_model.assert_not_called()
+    compile_model.assert_not_called()
+    assert controller.current()["weights_reloaded"] is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_graph_replay_observes_hot_switched_router_buffers(monkeypatch):
+    device = torch.device("cuda")
+    router = LogitTopKRouter(top_k=2, global_num_experts=4)
+    controller = _make_expert_context_controller(
+        monkeypatch,
+        [router],
+        device=device,
+    )
+    controller.register_context(
+        ExpertContextSpec(
+            context_id="masked",
+            layers={2: frozenset({0, 2})},
+        )
+    )
+    ineligibility_buffer = router._expert_ineligibility_mask
+    assert ineligibility_buffer is not None
+    buffer_identity = ineligibility_buffer.data_ptr()
+    hidden_states = torch.empty((1, 1), device=device)
+    source_logits = torch.tensor([[1.0, 4.0, 3.0, 2.0]], device=device)
+    graph_logits = torch.empty_like(source_logits)
+
+    def route_with_graph_buffers():
+        graph_logits.copy_(source_logits)
+        return router.select_experts(hidden_states, graph_logits)
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            route_with_graph_buffers()
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_weights, graph_ids = route_with_graph_buffers()
+
+    for context_id in ("masked", "baseline", "masked"):
+        controller.prepare_context(context_id)
+        controller.commit_context()
+        eager_weights, eager_ids = router.select_experts(
+            hidden_states, source_logits.clone()
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(graph_weights, eager_weights)
+        assert torch.equal(graph_ids, eager_ids)
+        assert ineligibility_buffer.data_ptr() == buffer_identity
 
 
 def test_expert_context_canonicalizes_omitted_layers_and_fingerprints(

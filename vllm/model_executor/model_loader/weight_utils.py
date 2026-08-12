@@ -43,6 +43,10 @@ from vllm.model_executor.layers.quantization import (
 from vllm.model_executor.model_loader.ep_weight_filter import (
     should_skip_weight,
 )
+from vllm.model_load_progress import (
+    current_worker_coordinates,
+    emit_model_load_progress,
+)
 from vllm.platforms import current_platform
 from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import hf_api, hf_fs
@@ -427,6 +431,69 @@ def get_sparse_attention_config(
     return config
 
 
+def _cached_weight_stats(
+    model_name_or_path: str,
+    cache_dir: str | None,
+    allow_patterns: list[str],
+    revision: str | None,
+    subfolder: str | None,
+) -> tuple[int, int] | None:
+    try:
+        cache = huggingface_hub.scan_cache_dir(cache_dir)
+    except Exception:
+        return None
+
+    for repo in cache.repos:
+        if repo.repo_type != "model" or repo.repo_id != model_name_or_path:
+            continue
+        for cached_revision in repo.revisions:
+            if revision is not None and revision not in {
+                cached_revision.commit_hash,
+                *cached_revision.refs,
+            }:
+                continue
+            files = [
+                file
+                for file in cached_revision.files
+                if (subfolder is None or file.file_name.startswith(f"{subfolder}/"))
+                and any(
+                    fnmatch.fnmatch(file.file_name, pattern)
+                    or fnmatch.fnmatch(Path(file.file_name).name, pattern)
+                    for pattern in allow_patterns
+                )
+            ]
+            if files:
+                return len(files), sum(file.size_on_disk for file in files)
+    return None
+
+
+def _resolved_weight_stats(
+    hf_folder: str,
+    allow_patterns: list[str | list[str]],
+    subfolder: str | None,
+) -> tuple[int, int] | None:
+    try:
+        folder = Path(hf_folder)
+        if subfolder is not None:
+            folder /= subfolder
+        patterns = [
+            pattern
+            for group in allow_patterns
+            for pattern in (group if isinstance(group, list) else [group])
+        ]
+        files = {
+            path.resolve()
+            for pattern in patterns
+            for path in folder.glob(pattern)
+            if path.is_file()
+        }
+        if not files:
+            return None
+        return len(files), sum(path.stat().st_size for path in files)
+    except OSError:
+        return None
+
+
 @instrument(span_name="Download weights - HF")
 def download_weights_from_hf(
     model_name_or_path: str,
@@ -456,7 +523,112 @@ def download_weights_from_hf(
         str: The path to the downloaded model weights.
     """
     assert len(allow_patterns) > 0
+    rank, _ = current_worker_coordinates()
+    is_coordinator = rank in {None, 0}
+    if is_coordinator:
+        emit_model_load_progress(
+            "checking_cache",
+            "started",
+            "Inspecting the local Hugging Face cache for the requested checkpoint",
+            rank=0,
+            world_size=1,
+        )
+    cache_stats = (
+        _cached_weight_stats(
+            model_name_or_path,
+            cache_dir,
+            allow_patterns,
+            revision,
+            subfolder,
+        )
+        if is_coordinator
+        else None
+    )
+    if cache_stats is not None:
+        cache_detail = (
+            "Found matching requested checkpoint files in the local Hugging Face cache"
+        )
+    else:
+        cache_detail = (
+            "No complete matching checkpoint footprint was confirmed in local cache"
+        )
+    if is_coordinator:
+        emit_model_load_progress(
+            "checking_cache",
+            "completed",
+            cache_detail,
+            rank=0,
+            world_size=1,
+            files_current=cache_stats[0] if cache_stats is not None else None,
+            files_total=cache_stats[0] if cache_stats is not None else None,
+            bytes_current=cache_stats[1] if cache_stats is not None else None,
+            bytes_total=cache_stats[1] if cache_stats is not None else None,
+        )
+        emit_model_load_progress(
+            "downloading",
+            "started",
+            "Resolving the requested Hugging Face checkpoint snapshot",
+            rank=0,
+            world_size=1,
+        )
+    try:
+        hf_folder, effective_patterns = _download_weights_from_hf(
+            model_name_or_path,
+            cache_dir,
+            allow_patterns,
+            revision,
+            subfolder,
+            ignore_patterns,
+        )
+    except BaseException as error:
+        if is_coordinator:
+            emit_model_load_progress(
+                "downloading",
+                "failed",
+                f"Checkpoint snapshot resolution failed ({type(error).__name__})",
+                rank=0,
+                world_size=1,
+            )
+        raise
+
+    resolved_stats = (
+        _resolved_weight_stats(
+            hf_folder,
+            effective_patterns,
+            subfolder,
+        )
+        if is_coordinator
+        else None
+    )
+    if is_coordinator:
+        emit_model_load_progress(
+            "downloading",
+            "completed",
+            (
+                "Requested checkpoint snapshot is materialized; byte and file "
+                "counters describe the resolved footprint, not measured network "
+                "transfer"
+            ),
+            rank=0,
+            world_size=1,
+            files_current=resolved_stats[0] if resolved_stats is not None else None,
+            files_total=resolved_stats[0] if resolved_stats is not None else None,
+            bytes_current=resolved_stats[1] if resolved_stats is not None else None,
+            bytes_total=resolved_stats[1] if resolved_stats is not None else None,
+        )
+    return hf_folder
+
+
+def _download_weights_from_hf(
+    model_name_or_path: str,
+    cache_dir: str | None,
+    allow_patterns: list[str],
+    revision: str | None = None,
+    subfolder: str | None = None,
+    ignore_patterns: str | list[str] | None = None,
+) -> tuple[str, list[str | list[str]]]:
     local_only = huggingface_hub.constants.HF_HUB_OFFLINE
+    effective_patterns: list[str | list[str]] = list(allow_patterns)
     if not local_only:
         # Attempt to reduce allow_patterns to a single pattern
         # so we only have to call snapshot_download once.
@@ -485,14 +657,14 @@ def download_weights_from_hf(
                 if weight_map:
                     # Extra [] so that weight_map files are treated as a
                     # single allow_pattern in the loop below
-                    allow_patterns = [list(set(weight_map.values()))]  # type: ignore[list-item]
+                    effective_patterns = [list(set(weight_map.values()))]
                 else:
-                    allow_patterns = ["*.safetensors"]
+                    effective_patterns = ["*.safetensors"]
             else:
                 # Use the first pattern found in the HF repo's files.
                 for pattern in allow_patterns:
                     if fnmatch.filter(file_list, pattern):
-                        allow_patterns = [pattern]
+                        effective_patterns = [pattern]
                         break
         except Exception as e:
             logger.warning(
@@ -503,12 +675,12 @@ def download_weights_from_hf(
                 e,
             )
 
-    logger.debug("Using model weights format %s", allow_patterns)
+    logger.debug("Using model weights format %s", effective_patterns)
     # Use file lock to prevent multiple processes from
     # downloading the same model weights at the same time.
     with get_lock(model_name_or_path, cache_dir):
         start_time = time.perf_counter()
-        for allow_pattern in allow_patterns:
+        for allow_pattern in effective_patterns:
             hf_folder = hf_api().snapshot_download(
                 model_name_or_path,
                 allow_patterns=allow_pattern,
@@ -532,7 +704,7 @@ def download_weights_from_hf(
                 model_name_or_path,
                 time_taken,
             )
-    return hf_folder
+    return hf_folder, effective_patterns
 
 
 def download_safetensors_index_file_from_hf(
